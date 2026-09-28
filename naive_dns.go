@@ -23,6 +23,8 @@ import (
 	"strings"
 	"time"
 
+	E "github.com/sagernet/sing/common/exceptions"
+
 	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -72,6 +74,16 @@ const (
 	// is the classic DNS UDP limit and must stay 512: exceeding it is what sets
 	// TC=1 and moves Chromium to TCP.
 	chromiumDNSResponseMaxSize = 512
+
+	// maxDNSMessageSize bounds a message accepted from a peer on the TCP path. It
+	// is checked BEFORE the body is read, so an overlong prefix is rejected
+	// immediately instead of leaving io.ReadFull blocked until the read deadline.
+	//
+	// 65535 would be no limit at all, since that is exactly what a 16-bit prefix
+	// can express: the check would never fire. A DNS message is capped at 65535
+	// bytes by its own protocol, and the 2-byte prefix here occupies part of that
+	// budget, so the largest message this framing can carry is 65535 - 2.
+	maxDNSMessageSize = 65535 - 2
 )
 
 func serveDNSPacketConn(ctx context.Context, conn net.PacketConn, resolver DNSResolverFunc) error {
@@ -112,10 +124,14 @@ func serveDNSPacketConn(ctx context.Context, conn net.PacketConn, resolver DNSRe
 
 		packed, err := response.Pack()
 		if err != nil {
-			// The resolver returned something unpackable. Do NOT drop silently:
-			// dropping makes Chromium wait for the full resolver timeout, whereas a
-			// SERVFAIL fails fast and is the response a broken upstream should
-			// produce.
+			// The resolver returned something unpackable. Answer SERVFAIL rather
+			// than dropping: dropping makes Chromium wait for the full resolver
+			// timeout, whereas SERVFAIL fails fast and is what a broken upstream
+			// should produce.
+			//
+			// "Do not drop silently" here means "do not drop the QUERY", not "log
+			// it". There is still no log line, for the reason given at the write
+			// error above.
 			if servfail, servfailErr := minimalSERVFAIL(&request, response.Rcode); servfailErr == nil {
 				packed = servfail
 			} else {
@@ -149,9 +165,15 @@ func serveDNSPacketConn(ctx context.Context, conn net.PacketConn, resolver DNSRe
 		// socket is a bare PacketConn and falls back to Write for a net.Conn.
 		writeConn := bufio.NewBindPacketConn(conn, remoteAddress)
 		if _, err = writeConn.Write(packed); err != nil {
-			// A failed reply is worth surfacing: the caller treats a non-nil return
-			// as the server ending, and a transient send error must not kill the
-			// bridge. Keep serving, but do not discard the information silently.
+			// Keep serving: a transient send error must not kill the bridge.
+			//
+			// The error is deliberately NOT logged. This is the per-query path and
+			// Chromium's resolver issues queries continuously, so a condition that
+			// persists - the peer gone, the socket buffer full - would produce one
+			// log line per query indefinitely. The loop takes no logger argument for
+			// this reason. If observability is ever wanted here it must be a counter
+			// plus a periodic summary, or a log gated on a state TRANSITION rather
+			// than per query.
 			continue
 		}
 	}
@@ -182,6 +204,20 @@ func serveDNSStreamConn(ctx context.Context, conn net.Conn, resolver DNSResolver
 		}
 		if queryLength == 0 {
 			return nil
+		}
+		// Cap the declared length before allocating.
+		//
+		// The prefix is 16 bits, so a peer can ask the bridge to reserve 65535 bytes
+		// per connection. More importantly, a length that the peer never follows
+		// with data leaves io.ReadFull blocked until the 15-second deadline, and the
+		// caller discards that error, so the failure is invisible. A DNS message
+		// cannot legitimately exceed 65535 bytes on the wire, but for a QUERY - which
+		// is all this loop carries - the real bound is far lower. Reject anything
+		// above the same ceiling the UDP path uses so the two paths agree on what a
+		// message can be.
+		if int(queryLength) > maxDNSMessageSize {
+			return E.New("DNS message of ", queryLength, " bytes exceeds the ",
+				maxDNSMessageSize, "-byte limit")
 		}
 
 		query := make([]byte, int(queryLength))

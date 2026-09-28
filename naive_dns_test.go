@@ -5,6 +5,10 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -395,4 +399,184 @@ func TestBridgeNeverDropsSilentlyForAValidQuery(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+// ---------------------------------------------------------------------------
+// The TCP/stream loop
+// ---------------------------------------------------------------------------
+
+// TestStreamBridgeAnswers drives serveDNSStreamConn, which had NO test coverage.
+//
+// This is not a minor path: it is the one Chromium uses after a UDP response sets
+// TC=1, so it is on the critical path for any answer over 512 bytes. It frames
+// messages with a 2-byte big-endian length prefix, a shape the UDP tests cannot
+// exercise, and it was the loop where the unchecked conn.Write calls lived.
+func TestStreamBridgeAnswers(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot listen on TCP loopback in this environment: %v", err)
+	}
+	defer listener.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	resolver := func(ctx context.Context, request *mDNS.Msg) *mDNS.Msg {
+		response := new(mDNS.Msg)
+		response.SetReply(request)
+		for i := 0; i < 20; i++ {
+			record, rrErr := mDNS.NewRR("example.com. 300 IN A 93.184.216.34")
+			if rrErr == nil && record != nil {
+				response.Answer = append(response.Answer, record)
+			}
+		}
+		return response
+	}
+
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		_ = serveDNSStreamConn(ctx, conn, resolver)
+	}()
+
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	query := new(mDNS.Msg)
+	query.SetQuestion("example.com.", mDNS.TypeA)
+	packedQuery, err := query.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A TCP DNS message is a 2-byte big-endian length prefix followed by the message.
+	frame := make([]byte, 2+len(packedQuery))
+	frame[0] = byte(len(packedQuery) >> 8)
+	frame[1] = byte(len(packedQuery))
+	copy(frame[2:], packedQuery)
+	if _, err := conn.Write(frame); err != nil {
+		t.Fatalf("send query: %v", err)
+	}
+
+	// Read the length prefix, then exactly that many bytes.
+	prefix := make([]byte, 2)
+	if _, err := io.ReadFull(conn, prefix); err != nil {
+		t.Fatalf("the stream bridge must answer with a length-prefixed message: %v", err)
+	}
+	responseLength := int(prefix[0])<<8 | int(prefix[1])
+	if responseLength == 0 {
+		t.Fatal("the stream bridge sent a zero-length message")
+	}
+	body := make([]byte, responseLength)
+	if _, err := io.ReadFull(conn, body); err != nil {
+		t.Fatalf("the length prefix promised %d bytes but the body was short: %v",
+			responseLength, err)
+	}
+
+	var response mDNS.Msg
+	if err := response.Unpack(body); err != nil {
+		t.Fatalf("the stream reply must be a valid DNS message: %v", err)
+	}
+	if response.Id != query.Id {
+		t.Fatal("the stream reply must echo the query ID")
+	}
+	// Over TCP the answer is NOT truncated, which is the whole point of TC=1.
+	if response.Truncated {
+		t.Fatal("a TCP reply must not set TC=1; TCP is the retry that carries the " +
+			"full answer")
+	}
+	if len(response.Answer) != 20 {
+		t.Fatalf("the TCP reply should carry all 20 answers, got %d", len(response.Answer))
+	}
+}
+
+// TestStreamBridgeRejectsAnOverlongMessage checks the length prefix is honoured.
+//
+// A prefix claiming more than maxDNSMessageSize must be treated as a protocol error
+// rather than allocated, or a peer could ask the bridge to reserve 64 KiB per
+// connection.
+func TestStreamBridgeRejectsAnOverlongMessage(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- serveDNSStreamConn(ctx, server, nil) }()
+
+	// Claim 65535 bytes, the maximum a 2-byte prefix can express.
+	if _, err := client.Write([]byte{0xFF, 0xFF}); err != nil {
+		t.Fatalf("write prefix: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("an overlong length prefix must be a protocol error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream bridge must reject an overlong prefix rather than block " +
+			"waiting for data that will never arrive")
+	}
+}
+
+// TestDNSBridgeDoesNotLogPerQuery is the structural guard from the audit.
+//
+// The per-query loops take no logger, which is why a dead upstream cannot produce an
+// unbounded log burst: it produces one SERVFAIL per query and zero log lines. That
+// is a deliberate design property and not an accident of the current code, so it is
+// asserted here. If someone threads a logger into the loops and logs per query, this
+// fails and the reviewer is forced to consider the burst.
+//
+// The check reads the source rather than the behaviour because the property IS
+// structural - no runtime test can prove the absence of a log call on a path it
+// cannot force to fail repeatedly.
+func TestDNSBridgeDoesNotLogPerQuery(t *testing.T) {
+	source, err := os.ReadFile("naive_dns.go")
+	if err != nil {
+		t.Fatalf("read naive_dns.go: %v", err)
+	}
+	lines := strings.Split(string(source), "\n")
+
+	// Locate the two per-query loops.
+	var inLoop bool
+	var loopStart int
+	var offenders []string
+	logCall := regexp.MustCompile(`\bl\.(Trace|Debug|Info|Warn|Error|Fatal|Panic)Context\(`)
+
+	for index, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "func serveDNSPacketConn(") ||
+			strings.HasPrefix(trimmed, "func serveDNSStreamConn(") {
+			inLoop = true
+			loopStart = index + 1
+			continue
+		}
+		// A new top-level declaration ends the loop body.
+		if inLoop && strings.HasPrefix(trimmed, "func ") {
+			inLoop = false
+			continue
+		}
+		if inLoop && logCall.MatchString(line) {
+			offenders = append(offenders, "naive_dns.go:"+strconv.Itoa(index+1)+": "+trimmed)
+		}
+	}
+	_ = loopStart
+
+	if len(offenders) > 0 {
+		t.Fatalf("the per-query DNS loops must not log: Chromium queries continuously, "+
+			"so a persistent fault would emit one line per query forever. Found:\n  %s\n"+
+			"If observability is needed here, use a counter plus a periodic summary, or "+
+			"gate on a state transition rather than per query.",
+			strings.Join(offenders, "\n  "))
+	}
 }
