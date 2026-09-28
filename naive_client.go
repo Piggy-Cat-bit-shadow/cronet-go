@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -44,6 +45,65 @@ const (
 	clientStateClosing
 	clientStateClosed
 )
+
+// Naive control headers.
+//
+// These are consumed by the Naive implementation rather than forwarded as
+// ordinary request headers, and overriding them changes protocol behaviour:
+//
+//	Padding                 enables the padded framing on the SERVER side. An empty
+//	                        value turns framing off at the server while this client
+//	                        keeps framing, so every byte after CONNECT is
+//	                        misinterpreted - a guaranteed stream corruption.
+//	Proxy-Authorization     the credentials. Overriding it contradicts an explicit
+//	                        username/password configuration and yields an
+//	                        unexplained 407.
+//	-connect-authority      the CONNECT target. Overriding it can make the tunnel
+//	                        reach a host the user never configured, which is a
+//	                        routing-integrity failure.
+//	-force-quic              selects the QUIC path.
+//	-network-isolation-key  the connection-pool isolation key. This one is written
+//	                        AFTER the extraHeaders loop, so it was never
+//	                        overridable, but it is listed for completeness so the
+//	                        set stays honest as the implementation changes.
+//
+// HTTP header names are case-insensitive, so "Padding", "padding" and "PADDING"
+// are the same header and must all collide. The dashes-prefixed entries are
+// Cronet-internal pseudo-controls; they are matched case-insensitively too, which
+// is strictly safer than matching them exactly.
+var reservedNaiveHeaders = []string{
+	"Padding",
+	"Proxy-Authorization",
+	"-connect-authority",
+	"-force-quic",
+	"-network-isolation-key",
+}
+
+// IsReservedNaiveHeader reports whether name collides with a Naive control header.
+//
+// The comparison is case-insensitive, because that is how HTTP treats header
+// names: a case-sensitive check would let "padding" through and corrupt the
+// stream.
+func IsReservedNaiveHeader(name string) bool {
+	for _, reserved := range reservedNaiveHeaders {
+		if strings.EqualFold(name, reserved) {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateExtraHeaders rejects a user header set that would override a control
+// header, so the misconfiguration surfaces as a configuration error instead of a
+// stream corruption, an unexplained 407, or a tunnel to the wrong host.
+func ValidateExtraHeaders(extraHeaders map[string]string) error {
+	for key := range extraHeaders {
+		if IsReservedNaiveHeader(key) {
+			return E.New("extra_headers must not override the reserved Naive control header ", key)
+		}
+	}
+	return nil
+}
 
 type NaiveClient struct {
 	state                    atomic.Uint32
@@ -101,6 +161,12 @@ type NaiveClientOptions struct {
 }
 
 func NewNaiveClient(config NaiveClientOptions) (*NaiveClient, error) {
+	// Reject a reserved-header collision BEFORE anything else, so the
+	// misconfiguration is reported as a configuration error and does not depend
+	// on the native library being loadable.
+	if err := ValidateExtraHeaders(config.ExtraHeaders); err != nil {
+		return nil, err
+	}
 	err := checkLibrary()
 	if err != nil {
 		return nil, err
@@ -474,7 +540,14 @@ func (c *NaiveClient) DialEarly(ctx context.Context, destination M.Socksaddr) (N
 	if c.quicEnabled {
 		headers["-force-quic"] = "true"
 	}
+	// extraHeaders are user-supplied and must not override the control headers
+	// above. NewNaiveClient rejects a colliding configuration up front, so this
+	// loop cannot displace a control value; the guard here is defensive in case a
+	// caller constructs the client without going through the constructor.
 	for key, value := range c.extraHeaders {
+		if IsReservedNaiveHeader(key) {
+			continue
+		}
 		headers[key] = value
 	}
 
