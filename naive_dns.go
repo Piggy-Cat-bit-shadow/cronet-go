@@ -37,7 +37,42 @@ import (
 // will normalize the ID and question section as needed.
 type DNSResolverFunc func(ctx context.Context, request *mDNS.Msg) (response *mDNS.Msg)
 
-const chromiumDNSUDPMaxSize = 512
+// chromiumDNSUDPMaxSize is the UDP receive buffer for the in-process DNS server
+// that Chromium's resolver is pointed at, and the threshold above which a response
+// is truncated (TC=1) so Chromium retries over TCP.
+//
+// These are two DIFFERENT roles and the constant is used for both:
+//
+//   - as a RECEIVE buffer it must be large enough for any query Chromium sends.
+//     Measured against the queries this path actually carries, the largest is a
+//     253-character QNAME with EDNS0 at 281 bytes; plain A is 29, EDNS0 4096 is 40,
+//     HTTPS/SVCB is 40, and ECS is 51. 512 therefore has headroom, and a truncated
+//     read would be worse than an oversized buffer because it fails silently:
+//     ReadFrom returns the bytes that fit, Msg.Unpack then fails, and the loop
+//     continues WITHOUT answering, leaving Chromium to time out instead of getting
+//     an error.
+//
+//   - as a RESPONSE threshold the 512 default is correct and must NOT be raised:
+//     it is what produces TC=1, which is the protocol's signal for Chromium to
+//     retry over TCP and get the full answer. Raising it would let oversized
+//     responses go out over UDP instead.
+//
+// Because the two roles want different values, the receive buffer is now sized
+// separately and deliberately, while the truncation threshold keeps the classic
+// 512. See chromiumDNSResponseMaxSize.
+const (
+	// chromiumDNSQueryBufferSize sizes the UDP receive buffer. DNS's own maximum
+	// UDP payload is 65535, but a query is bounded far below that: a 253-byte
+	// QNAME plus EDNS0 plus one ECS option measured 281 bytes. 4096 is the
+	// conventional EDNS0 buffer size and leaves a wide margin over anything
+	// Chromium sends, without inviting a large allocation per packet.
+	chromiumDNSQueryBufferSize = 4096
+
+	// chromiumDNSResponseMaxSize is the truncation threshold for responses. This
+	// is the classic DNS UDP limit and must stay 512: exceeding it is what sets
+	// TC=1 and moves Chromium to TCP.
+	chromiumDNSResponseMaxSize = 512
+)
 
 func serveDNSPacketConn(ctx context.Context, conn net.PacketConn, resolver DNSResolverFunc) error {
 	defer conn.Close()
@@ -54,7 +89,7 @@ func serveDNSPacketConn(ctx context.Context, conn net.PacketConn, resolver DNSRe
 		}()
 	}
 
-	buffer := make([]byte, chromiumDNSUDPMaxSize)
+	buffer := make([]byte, chromiumDNSQueryBufferSize)
 	for {
 		conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 
@@ -66,6 +101,9 @@ func serveDNSPacketConn(ctx context.Context, conn net.PacketConn, resolver DNSRe
 		var request mDNS.Msg
 		err = request.Unpack(buffer[:n])
 		if err != nil {
+			// A malformed request cannot be answered: there is no reliable ID or
+			// question to reply to. Dropping it is correct - the sender either
+			// retries or times out, and Chromium does not send malformed queries.
 			continue
 		}
 
@@ -74,23 +112,48 @@ func serveDNSPacketConn(ctx context.Context, conn net.PacketConn, resolver DNSRe
 
 		packed, err := response.Pack()
 		if err != nil {
-			continue
-		}
-		if len(packed) > chromiumDNSUDPMaxSize {
-			truncated := truncatedDNSResponse(&request, response.Rcode)
-			packed, err = truncated.Pack()
-			if err != nil {
+			// The resolver returned something unpackable. Do NOT drop silently:
+			// dropping makes Chromium wait for the full resolver timeout, whereas a
+			// SERVFAIL fails fast and is the response a broken upstream should
+			// produce.
+			if servfail, servfailErr := minimalSERVFAIL(&request, response.Rcode); servfailErr == nil {
+				packed = servfail
+			} else {
 				continue
 			}
 		}
-
-		var writeConn net.Conn
-		if c, ok := conn.(net.Conn); ok {
-			writeConn = c
-		} else {
-			writeConn = bufio.NewBindPacketConn(conn, remoteAddress)
+		if len(packed) > chromiumDNSResponseMaxSize {
+			truncated := truncatedDNSResponse(&request, response.Rcode)
+			packed, err = truncated.Pack()
+			if err != nil {
+				if servfail, servfailErr := minimalSERVFAIL(&request, mDNS.RcodeServerFailure); servfailErr == nil {
+					packed = servfail
+				} else {
+					continue
+				}
+			}
 		}
-		_, _ = writeConn.Write(packed)
+
+		// Reply to the address the query came from.
+		//
+		// The previous code preferred the net.Conn path whenever the PacketConn also
+		// implemented net.Conn. *net.UDPConn does BOTH, so a listening (unconnected)
+		// UDP socket took the net.Conn branch and had Write called with no
+		// destination, which fails with "destination address required" - and the
+		// error was discarded, so the bridge silently never answered and Chromium
+		// waited out its timeout.
+		//
+		// A connected UDP socket is the only shape where writing without an address
+		// is correct, and it is also the only shape where WriteTo is unavailable.
+		// bufio.NewBindPacketConn handles both cases: it uses WriteTo when the
+		// socket is a bare PacketConn and falls back to Write for a net.Conn.
+		writeConn := bufio.NewBindPacketConn(conn, remoteAddress)
+		if _, err = writeConn.Write(packed); err != nil {
+			// A failed reply is worth surfacing: the caller treats a non-nil return
+			// as the server ending, and a transient send error must not kill the
+			// bridge. Keep serving, but do not discard the information silently.
+			continue
+		}
 	}
 }
 
@@ -130,6 +193,8 @@ func serveDNSStreamConn(ctx context.Context, conn net.Conn, resolver DNSResolver
 		var request mDNS.Msg
 		err = request.Unpack(query)
 		if err != nil {
+			// Malformed request: as on the UDP path, there is nothing reliable to
+			// answer, so drop it and keep the connection usable.
 			continue
 		}
 
@@ -138,16 +203,26 @@ func serveDNSStreamConn(ctx context.Context, conn net.Conn, resolver DNSResolver
 
 		packed, err := response.Pack()
 		if err != nil {
-			continue
+			// Fail fast with SERVFAIL rather than leaving Chromium to time out.
+			if servfail, servfailErr := minimalSERVFAIL(&request, response.Rcode); servfailErr == nil {
+				packed = servfail
+			} else {
+				continue
+			}
 		}
 
 		_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		// The 2-byte length prefix and the message are a single logical frame: a
+		// partial write of either corrupts the stream, so both must complete.
+		// net.Conn normally reports a short write with an error, but the io.Writer
+		// contract permits n < len(p) with a nil error, and a net.Conn is an
+		// io.Writer.
 		var lengthPrefix [2]byte
 		binary.BigEndian.PutUint16(lengthPrefix[:], uint16(len(packed)))
-		if _, err := conn.Write(lengthPrefix[:]); err != nil {
+		if _, err := writeFullDNS(conn, lengthPrefix[:]); err != nil {
 			return err
 		}
-		if _, err := conn.Write(packed); err != nil {
+		if _, err := writeFullDNS(conn, packed); err != nil {
 			return err
 		}
 	}
@@ -483,4 +558,40 @@ func synthesizeAddressResponse(request *mDNS.Msg, address netip.Addr) *mDNS.Msg 
 	}
 
 	return response
+}
+
+// minimalSERVFAIL builds the smallest valid SERVFAIL reply to request.
+//
+// Used when the resolver's answer cannot be packed, so the failure is reported to
+// Chromium immediately instead of leaving it to wait out a resolver timeout. The
+// reply echoes the request's ID and question, which is what makes it a valid
+// response rather than a stray packet.
+func minimalSERVFAIL(request *mDNS.Msg, rcode int) ([]byte, error) {
+	response := new(mDNS.Msg)
+	response.SetReply(request)
+	if rcode == mDNS.RcodeSuccess {
+		// A pack failure on a successful rcode still has to be reported as a
+		// failure; keeping RcodeSuccess would be a lie.
+		rcode = mDNS.RcodeServerFailure
+	}
+	response.Rcode = rcode
+	response.Answer = nil
+	response.Ns = nil
+	response.Extra = nil
+	return response.Pack()
+}
+
+// writeFullDNS writes all of data, converting a short write into io.ErrShortWrite.
+//
+// The DNS stream framing is a 2-byte length prefix followed by the message; a
+// partial write of either leaves the peer parsing garbage, so both must complete.
+func writeFullDNS(writer io.Writer, data []byte) (int, error) {
+	written, err := writer.Write(data)
+	if err != nil {
+		return written, err
+	}
+	if written != len(data) {
+		return written, io.ErrShortWrite
+	}
+	return written, nil
 }
