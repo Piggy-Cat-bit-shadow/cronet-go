@@ -171,6 +171,22 @@ func NewNaiveClient(config NaiveClientOptions) (*NaiveClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	return newNaiveClientWithoutLibraryCheck(config)
+}
+
+// newNaiveClientWithoutLibraryCheck builds the client without requiring the native
+// library to be loadable.
+//
+// It exists so the lifecycle state machine - the CAS transitions in Start and Close,
+// and the cleanup they promise - can be tested on any machine, including CI runners
+// with no Cronet build. That logic is pure Go and its failure modes (a leaked
+// goroutine, a Close that never completes, a second Close that panics) are exactly
+// the ones that only show up under -race or in a long-running client, so it should
+// not be reachable only through a test that needs native binaries.
+//
+// It is unexported and performs no I/O, so it cannot be used to skip the library
+// check in production: NewNaiveClient always calls checkLibrary first.
+func newNaiveClientWithoutLibraryCheck(config NaiveClientOptions) (*NaiveClient, error) {
 	if !config.ServerAddress.IsValid() {
 		return nil, E.New("invalid server address")
 	}
@@ -254,6 +270,30 @@ func (c *NaiveClient) Start() error {
 
 	var startError error
 	var engines []Engine
+
+	// The engine creation path panics rather than returning an error when the native
+	// library cannot be loaded (internal/cronet.ensureLoaded calls panic(err), reached
+	// through NewEngine). Convert that into an ordinary error.
+	//
+	// Without this, Start panics and the deferred cleanup below NEVER RUNS, because a
+	// panic unwinds past it. The result was that a failed start left the state at
+	// clientStateStarting, never closed the started channel, and leaked any engines
+	// already created - so every later Start returned "start already in progress" and
+	// every Close blocked forever waiting on that channel.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			startError = E.Cause(panicError(recovered), "start cronet engine")
+			if c.proxyCancel != nil {
+				c.proxyCancel()
+			}
+			for _, engine := range engines {
+				engine.Shutdown()
+				engine.Destroy()
+			}
+			c.state.Store(uint32(clientStateClosed))
+			close(c.started)
+		}
+	}()
 
 	defer func() {
 		if startError != nil {
@@ -679,4 +719,12 @@ func (c *trackedNaiveConn) ReaderReplaceable() bool {
 
 func (c *trackedNaiveConn) WriterReplaceable() bool {
 	return true
+}
+
+// panicError converts a recovered panic value into an error.
+func panicError(recovered any) error {
+	if err, isError := recovered.(error); isError {
+		return err
+	}
+	return E.New(F.ToString(recovered))
 }
