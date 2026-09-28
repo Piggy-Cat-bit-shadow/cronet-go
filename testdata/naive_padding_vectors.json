@@ -1,0 +1,126 @@
+{
+  "_comment": [
+    "Shared Naive padding-protocol test vectors.",
+    "",
+    "This file is the machine-checkable contract between the two independent",
+    "implementations of the Naive padding protocol:",
+    "",
+    "  A. klzgrad/forwardproxy  (the reference)  - branch naive, commit",
+    "     d62c80d3dd2c706b6b87579844d2397bddd18317",
+    "  B. sing-box Native Naive inbound          - protocol/naive/inbound_conn.go",
+    "  C. cronet-go Naive outbound               - naive_conn.go (this repository)",
+    "",
+    "B and C agreeing with each other is NOT sufficient evidence of correctness: two",
+    "implementations can share the same mistake and interoperate perfectly while both",
+    "diverging from the wire format the reference produces. Every expectation below is",
+    "therefore derived from A, whose AddPadding branch is:",
+    "",
+    "    paddingSize := rand.Intn(256)",
+    "    maxRead     := 65536 - 3 - paddingSize",
+    "    nr, er      := src.Read(buf[3:maxRead])",
+    "    if nr != nw { err = io.ErrShortWrite }",
+    "",
+    "Consumers must read the expectations from this file rather than restating them,",
+    "so that a change to the protocol shows up as a diff here.",
+    "",
+    "Both implementations' tests load this file. It is duplicated verbatim into",
+    "sing-box at test/jiejie/reference/naive_padding_vectors.json; the copies are",
+    "byte-identical and a test in each repository compares them by content hash."
+  ],
+
+  "protocol": "naive-padding-v1",
+  "reference": {
+    "repository": "https://github.com/klzgrad/forwardproxy",
+    "branch": "naive",
+    "commit": "d62c80d3dd2c706b6b87579844d2397bddd18317",
+    "padding_draw_expression": "rand.Intn(256)",
+    "payload_budget_expression": "65536 - 3 - paddingSize",
+    "num_first_paddings": 8,
+    "copy_buffer_size": 65536
+  },
+
+  "constants": {
+    "max_frame_size": 65536,
+    "frame_header_size": 3,
+    "max_padding": 255,
+    "min_padding": 0,
+    "padding_count": 8,
+    "max_payload_at_padding_0": 65533,
+    "max_payload_at_padding_255": 65278,
+    "writer_mtu": 65278,
+    "front_headroom": 3,
+    "rear_headroom": 255
+  },
+
+  "invariants": [
+    {
+      "id": "frame_ceiling",
+      "statement": "frame_header_size + payload + padding <= max_frame_size for every frame",
+      "expression": "3 + payload + padding <= 65536"
+    },
+    {
+      "id": "payload_budget",
+      "statement": "a frame's payload never exceeds the budget implied by its own padding draw",
+      "expression": "payload <= 65536 - 3 - padding"
+    },
+    {
+      "id": "writer_geometry",
+      "statement": "front headroom, MTU and rear headroom describe exactly one maximal frame",
+      "expression": "front_headroom + writer_mtu + rear_headroom == 65536"
+    },
+    {
+      "id": "padding_range_preserved",
+      "statement": "the full 0..255 padding range is reachable and is not clamped to fit a buffer",
+      "expression": "min_padding == 0 && max_padding == 255"
+    },
+    {
+      "id": "short_write_fails",
+      "statement": "a Write returning n < len(p) with a nil error is a failure",
+      "expression": "result == io.ErrShortWrite"
+    },
+    {
+      "id": "counter_advances_only_on_complete_frames",
+      "statement": "the padding frame counter advances only for frames wholly written",
+      "expression": "writePadding == frames_delivered"
+    },
+    {
+      "id": "raw_after_window",
+      "statement": "exactly padding_count frames are framed; the remainder is raw",
+      "expression": "framed_frames == min(padding_count, frames_needed)"
+    }
+  ],
+
+  "padding_draws": [0, 1, 2, 7, 31, 127, 254, 255],
+
+  "segmentation_cases": [
+    {"padding": 0,   "payload": 0,     "wire": 3,     "frames": 1},
+    {"padding": 0,   "payload": 1,     "wire": 4,     "frames": 1},
+    {"padding": 0,   "payload": 65533, "wire": 65536, "frames": 1},
+    {"padding": 255, "payload": 1,     "wire": 259,   "frames": 1},
+    {"padding": 255, "payload": 65278, "wire": 65536, "frames": 1},
+    {"padding": 127, "payload": 65406, "wire": 65536, "frames": 1}
+  ],
+
+  "chunking_cases": [
+    {"padding": 255, "payload": 65279, "frames": 2, "first_frame_payload": 65278,
+     "note": "one byte over the padding-255 budget spills into a second frame"},
+    {"padding": 127, "payload": 65407, "frames": 2, "first_frame_payload": 65406,
+     "note": "one byte over the padding-127 budget spills into a second frame"},
+    {"padding": 0,   "payload": 65534, "frames": 2, "first_frame_payload": 65533,
+     "note": "one byte over the padding-0 budget spills into a second frame"},
+    {"padding": 0,   "payload": 131066, "frames": 3, "first_frame_payload": 65533,
+     "note": "two full frames plus a remainder"}
+  ],
+
+  "oversized_rejection_cases": [
+    {"padding": 0,   "payload": 65534, "reason": "exceeds the padding-0 budget of 65533"},
+    {"padding": 1,   "payload": 65533, "reason": "exceeds the padding-1 budget of 65532"},
+    {"padding": 255, "payload": 65279, "reason": "exceeds the padding-255 budget of 65278"}
+  ],
+
+  "short_write_cases": [
+    {"name": "off_by_one_nil_error", "returned": -1, "error": null,      "want": "ErrShortWrite"},
+    {"name": "zero_nil_error",       "returned": 0,   "error": null,      "want": "ErrShortWrite"},
+    {"name": "sentinel_error",       "returned": -1,  "error": "sentinel", "want": "sentinel"}
+  ]
+}
