@@ -12,3 +12,4 @@ CLAUDE.md
 !/include/dummy.go
 /cgo_*.go
 /lib_*_cgo.go
+*.test
