@@ -44,9 +44,32 @@ void (*on_read_completed)(bidirectional_stream* stream, char* data, int bytes_re
    reports how many bytes landed in it. Between the `read` call and `on_read_completed`, the callee
    writes the buffer.
 
-3. **`on_canceled` is the only documented "no further callbacks" boundary.** The header states:
-   *"The on_canceled() method ... will be invoked when cancelation is complete and no further
-   callback methods will be invoked."* Only `on_canceled` carries that guarantee.
+3. **All three terminal callbacks are "no further callbacks" boundaries -- not just `on_canceled`.**
+   An earlier revision of this document claimed `on_canceled` was the only one. That is wrong, and
+   the header states the guarantee on all three (`include/bidirectional_stream_c.h`):
+
+   ```c
+   /* on_succeded: ... Once invoked, no further callback methods will be invoked. */
+   void (*on_succeded)(bidirectional_stream* stream);
+
+   /* on_failed:   ... Once invoked, no further callback methods will be invoked. */
+   void (*on_failed)(bidirectional_stream* stream, int net_error);
+
+   /* on_canceled: ... Once invoked, no further callback methods will be invoked. */
+   void (*on_canceled)(bidirectional_stream* stream);
+   ```
+
+   (The C field is spelled `on_succeded`; the Go binding exposes it as `OnSucceeded`.)
+
+   This matters because it is what makes the terminate safety-net in the Go binding sound. A stream
+   terminates on exactly one of three outcomes -- success, failure, cancellation -- and whichever
+   arrives first is a hard fence: nothing follows it. So a `terminate` that unpins anything still
+   outstanding is guaranteed to run after the last operation callback, on every path, not only on
+   the cancellation path.
+
+   Had the guarantee belonged to `on_canceled` alone, a stream that succeeded or failed with an
+   operation still in flight would have had no fence at all, and the safety-net would have been
+   releasing precisely the pinned memory the native side was still holding.
 
 4. **`destroy` is posted, not synchronous.** *"Destroy could be called from any thread, including
    network thread, but is posted, so |stream| is valid until calling task is complete."* Combined
@@ -90,8 +113,8 @@ case <-c.writeDeadline.Wait():
 The deadline path returns `os.ErrDeadlineExceeded` as soon as `c.done` closes. `c.done` closes in
 `terminate()`, which is reached from `OnFailed` / `OnCanceled` / `OnSucceeded` — and also from
 `cancelLocked`. After `terminate` the caller naturally reuses or releases `p`, while the native
-side may still be reading it: the header guarantees `on_canceled` precedes the end of callbacks, but
-the *posted* `destroy` and the engine's own teardown are not ordered against the Go function
+side may still be reading it: whichever terminal callback fired is a guaranteed end of *callbacks*,
+but the *posted* `destroy` and the engine's own teardown are not ordered against the Go function
 returning.
 
 The `<-c.close` path has the same shape.
