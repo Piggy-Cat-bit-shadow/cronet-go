@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -38,6 +39,83 @@ type BidirectionalConn struct {
 	onTerminate      func()
 	readDeadline     pipe.Deadline
 	writeDeadline    pipe.Deadline
+	// readPinned and writePinned hold the buffer the in-flight native operation is using.
+	//
+	// # Why the lifetime has to be tracked per operation
+	//
+	// bidirectional_stream_read/write hand a Go array's address to native code, which keeps it
+	// until the matching on_read_completed/on_write_completed callback fires. The Go side must
+	// therefore hold its own reference for that whole window, or the collector may free the array
+	// while native code is still reading or writing it.
+	//
+	// runtime.Pinner is that reference. It must be released only once the completion callback has
+	// actually run -- NOT when Read/Write returns, because those can return early:
+	//
+	//   - on deadline, Read/Write cancel the stream and return os.ErrDeadlineExceeded as soon as
+	//     done closes, while the native operation may still be in flight;
+	//   - on Close, the same happens through c.close.
+	//
+	// Releasing at return would hand the caller back a buffer that native code may still touch.
+	// The callback is the only event that proves the window is closed, so the unpin lives there.
+	readPinned  pinnedBuffer
+	writePinned pinnedBuffer
+}
+
+// pinnedBuffer holds a Go slice alive across a native async operation.
+//
+// It is deliberately minimal: one Pinner, the slice it covers, and a flag. The zero value is
+// ready to use and unpinning twice is a no-op, so the completion callback and the error paths can
+// both call release without coordinating.
+type pinnedBuffer struct {
+	// access serialises pin against release.
+	//
+	// # Why a lock is required here
+	//
+	// The two calls come from different goroutines: pin runs on the caller's goroutine inside
+	// Read/Write, and release runs on the ENGINE NETWORK THREAD from the completion callback. The
+	// header documents that callbacks are serialised with respect to EACH OTHER, but says nothing
+	// about the caller's goroutine, which is a different thread entirely.
+	//
+	// Without this lock the fields below are a data race, and -- worse than a reported race -- a
+	// release that reads a stale active==false could skip Unpin and leave the array pinned for the
+	// life of the connection.
+	access sync.Mutex
+	pinner runtime.Pinner
+	slice  []byte
+	active bool
+}
+
+// pin keeps buffer alive until release is called.
+//
+// A zero-length slice is not pinned: there is no array to keep alive, and Pin would panic on a nil
+// pointer. That matches the callers, which pass nil/0 for an empty read or write.
+func (p *pinnedBuffer) pin(buffer []byte) {
+	if len(buffer) == 0 {
+		return
+	}
+	p.access.Lock()
+	defer p.access.Unlock()
+	p.slice = buffer
+	p.active = true
+	p.pinner.Pin(&buffer[0])
+}
+
+// release drops the reference, allowing the array to be collected again.
+//
+// It is safe to call when nothing is pinned and safe to call more than once, which matters because
+// a failed operation can be released by both the callback and the calling goroutine.
+func (p *pinnedBuffer) release() {
+	p.access.Lock()
+	defer p.access.Unlock()
+	if !p.active {
+		return
+	}
+	p.active = false
+	p.pinner.Unpin()
+	// Keep the slice reachable until after Unpin, so the compiler cannot treat the pin as dead
+	// before it is dropped.
+	runtime.KeepAlive(p.slice)
+	p.slice = nil
 }
 
 func (e StreamEngine) CreateConn(ctx context.Context, l logger.ContextLogger, readWaitHeaders bool, writeWaitHeaders bool) *BidirectionalConn {
@@ -118,6 +196,30 @@ func (c *BidirectionalConn) terminate(err error) {
 	})
 	c.access.Unlock()
 
+	// Terminal safety net for pinning.
+	//
+	// # Why this is safe here, and why it is needed
+	//
+	// Every caller of terminate is either a TERMINAL callback or a local failure:
+	//
+	//	OnReadCompleted (bytesRead == 0)  the read already unpinned above
+	//	OnSucceeded / OnFailed / OnCanceled
+	//	                                  the header guarantees "no further callback methods will
+	//	                                  be invoked" for all three
+	//	Start failure                      no operation was ever in flight
+	//
+	// So once terminate has been entered from a terminal callback, no further native access to a
+	// pinned buffer can occur, and the references can be dropped.
+	//
+	// It is NOT sufficient to unpin when Read/Write returns, which is the bug this fixes: those
+	// return early on deadline and on Close, while the native operation may still be running. The
+	// terminal callback is the first moment the window is provably closed.
+	//
+	// Unpin is idempotent, so a normal completion (which already released in its own callback)
+	// passes through here as a no-op rather than a double release.
+	c.readPinned.release()
+	c.writePinned.release()
+
 	if onTerminate != nil {
 		onTerminate()
 	}
@@ -151,6 +253,10 @@ func (c *BidirectionalConn) Read(p []byte) (n int, err error) {
 		return 0, c.err
 	default:
 	}
+	// Pin BEFORE the native call. The native side writes into p asynchronously and reports
+	// completion through OnReadCompleted, so the array must stay alive from here until that
+	// callback runs -- which is why the corresponding release is in the callback, not here.
+	c.readPinned.pin(p)
 	c.stream.Read(p)
 	c.access.Unlock()
 
@@ -205,6 +311,9 @@ func (c *BidirectionalConn) Write(p []byte) (n int, err error) {
 		return 0, c.err
 	default:
 	}
+	// Pin BEFORE the native call, for the same reason as Read: the native side reads p until
+	// OnWriteCompleted fires, and this goroutine may return before that.
+	c.writePinned.pin(p)
 	c.stream.Write(p, false)
 	c.access.Unlock()
 
@@ -336,6 +445,17 @@ func (c *bidirectionalHandler) OnResponseHeadersReceived(stream BidirectionalStr
 }
 
 func (c *bidirectionalHandler) OnReadCompleted(stream BidirectionalStream, bytesRead int) {
+	// THE unpin point for a read.
+	//
+	// This callback is the only event that proves native code has finished writing the buffer
+	// passed to bidirectional_stream_read, so it is where the reference can be dropped. It runs
+	// before the result is delivered to the waiting goroutine, so the caller cannot observe a
+	// buffer that is still pinned and cannot reuse one that is not yet safe.
+	//
+	// It is also on the paths below that do NOT deliver a result (terminate on end-of-stream, and
+	// the close/done branches), which is what keeps a truncated read from leaking a pin.
+	c.readPinned.release()
+
 	if bytesRead == 0 {
 		c.terminate(io.EOF)
 		return
@@ -351,6 +471,10 @@ func (c *bidirectionalHandler) OnReadCompleted(stream BidirectionalStream, bytes
 }
 
 func (c *bidirectionalHandler) OnWriteCompleted(stream BidirectionalStream) {
+	// THE unpin point for a write, for the same reason as OnReadCompleted: this is the event that
+	// proves native code has consumed the buffer passed to bidirectional_stream_write.
+	c.writePinned.release()
+
 	select {
 	case <-c.close:
 		c.writeDoneOnce.Do(func() { close(c.writeDone) })
