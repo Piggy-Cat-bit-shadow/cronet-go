@@ -397,9 +397,36 @@ func (c *naiveConn) WriteBuffer(buffer *buf.Buffer) error {
 	return baderror.WrapH2(err)
 }
 
-func (c *naiveConn) FrontHeadroom() int      { return c.frontHeadroom() }
-func (c *naiveConn) RearHeadroom() int       { return c.rearHeadroom() }
-func (c *naiveConn) WriterMTU() int          { return c.writerMTU() }
-func (c *naiveConn) Upstream() any           { return c.Conn }
-func (c *naiveConn) ReaderReplaceable() bool { return c.readerReplaceable() }
-func (c *naiveConn) WriterReplaceable() bool { return c.writerReplaceable() }
+func (c *naiveConn) FrontHeadroom() int { return c.frontHeadroom() }
+func (c *naiveConn) RearHeadroom() int  { return c.rearHeadroom() }
+func (c *naiveConn) WriterMTU() int     { return c.writerMTU() }
+func (c *naiveConn) Upstream() any      { return c.Conn }
+
+// EarlyCopyBufferGrowth asks the copy loop feeding this writer to grow its buffer after the FIRST
+// transfer instead of after the default 512000 bytes.
+//
+// # Why this writer wants it, and why the inbound already had it
+//
+// Naive framing happens in place: the fast path prepends a 3-byte header and appends 0..255 bytes
+// of padding into the buffer it is handed. That only avoids a copy when the buffer arrives with
+// frontHeadroom() bytes before the payload and rearHeadroom() bytes after it, and when the payload
+// fits writerMTU(). The copy loop sizes its buffer from exactly those three values, so once it has
+// grown, every write is framed in place.
+//
+// Until it grows, each upload write is smaller than the geometry allows and is framed through the
+// chunking path instead, which allocates and copies per frame. The threshold is the difference
+// between the frame being built IN the caller's buffer and being built INTO A NEW ONE.
+//
+// The inbound side of this protocol has opted in for the same reason (protocol/naive
+// inbound_conn.go). This is the client-side writer, which is the one the upload copy loop feeds.
+//
+// # Why it is a method on the writer rather than a special case in the route layer
+//
+// The copy destination is the only component that knows the geometry it can accept, and the route
+// layer already asks it through adapter.CopyBufferGrowthTuner. Declaring the capability here means
+// the route layer needs no protocol name, no tag and no configuration check -- it sees a writer
+// that opts in, which is what structural typing is for. The type is an interface on the sing-box
+// side, so this package does not import the adapter and no dependency is created in this direction.
+func (c *naiveConn) EarlyCopyBufferGrowth() bool { return true }
+func (c *naiveConn) ReaderReplaceable() bool     { return c.readerReplaceable() }
+func (c *naiveConn) WriterReplaceable() bool     { return c.writerReplaceable() }
