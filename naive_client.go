@@ -554,7 +554,43 @@ func (c *NaiveClient) CloseAllConnections() {
 	}
 }
 
+// DialEarly starts one CONNECT stream and returns before the response arrives.
+//
+// The transport follows the client-level QUIC option, as it always has. Callers
+// that need to choose the transport per request use DialEarlyWithQUIC.
 func (c *NaiveClient) DialEarly(ctx context.Context, destination M.Socksaddr) (NaiveConn, error) {
+	return c.dialEarly(ctx, destination, c.quicEnabled)
+}
+
+// DialEarlyWithQUIC starts one CONNECT stream and chooses the transport for THIS
+// REQUEST, independently of the client-level QUIC option.
+//
+// # What it changes, and what it does not
+//
+// The only difference is whether the Naive control header `-force-quic: true`
+// is sent. That header is what makes Chromium restrict this request's ALPN set
+// to QUIC (net/http/bidirectional_stream.cc reads it into
+// HttpRequestInfo::force_quic, and the stream factory then allows QUIC only).
+// With forceQUIC=false the request uses Chromium's ordinary stream path, which
+// on a server that does not advertise Alt-Svc is HTTP/2.
+//
+// The ENGINE is untouched: enable_quic and enable_http2 are engine parameters
+// and both stay as the client started them. This is why one Engine can carry
+// both transports, and why nothing here needs a Chromium patch.
+//
+// # The limit callers must know
+//
+// "forceQUIC=false" is not a promise of H2 in every environment. On an engine
+// with QUIC enabled, a request can still be sent over QUIC through a cached
+// Alt-Svc entry for the origin (this is exactly SagerNet/cronet-go#11, which was
+// about the H2 mode silently negotiating QUIC). The Naive server does not
+// advertise Alt-Svc, so in practice the request is H2; a caller that needs a
+// hard guarantee must disable QUIC at the engine level instead.
+func (c *NaiveClient) DialEarlyWithQUIC(ctx context.Context, destination M.Socksaddr, forceQUIC bool) (NaiveConn, error) {
+	return c.dialEarly(ctx, destination, forceQUIC)
+}
+
+func (c *NaiveClient) dialEarly(ctx context.Context, destination M.Socksaddr, forceQUIC bool) (NaiveConn, error) {
 	state := clientState(c.state.Load())
 	switch state {
 	case clientStateRunning:
@@ -570,26 +606,7 @@ func (c *NaiveClient) DialEarly(ctx context.Context, destination M.Socksaddr) (N
 			return nil, c.ctx.Err()
 		}
 	}
-	headers := map[string]string{
-		"-connect-authority": destination.String(),
-		"Padding":            generatePaddingHeader(),
-	}
-	if c.authorization != "" {
-		headers["proxy-authorization"] = c.authorization
-	}
-	if c.quicEnabled {
-		headers["-force-quic"] = "true"
-	}
-	// extraHeaders are user-supplied and must not override the control headers
-	// above. NewNaiveClient rejects a colliding configuration up front, so this
-	// loop cannot displace a control value; the guard here is defensive in case a
-	// caller constructs the client without going through the constructor.
-	for key, value := range c.extraHeaders {
-		if IsReservedNaiveHeader(key) {
-			continue
-		}
-		headers[key] = value
-	}
+	headers := c.dialHeaders(destination, forceQUIC)
 
 	streamEngine := c.streamEngines[0]
 	if c.concurrency > 1 {
@@ -612,6 +629,34 @@ func (c *NaiveClient) DialEarly(ctx context.Context, destination M.Socksaddr) (N
 	c.activeConnections.Add(1)
 	conn.setOnTerminate(trackedConn.release)
 	return trackedConn, nil
+}
+
+// dialHeaders builds the Naive control headers for one CONNECT. It is a method
+// on the client rather than inline so the per-dial transport choice can be
+// asserted without a native library, which is the only way the two modes can be
+// tested on a machine that cannot start a Cronet engine.
+func (c *NaiveClient) dialHeaders(destination M.Socksaddr, forceQUIC bool) map[string]string {
+	headers := map[string]string{
+		"-connect-authority": destination.String(),
+		"Padding":            generatePaddingHeader(),
+	}
+	if c.authorization != "" {
+		headers["proxy-authorization"] = c.authorization
+	}
+	if forceQUIC {
+		headers["-force-quic"] = "true"
+	}
+	// extraHeaders are user-supplied and must not override the control headers
+	// above. NewNaiveClient rejects a colliding configuration up front, so this
+	// loop cannot displace a control value; the guard here is defensive in case a
+	// caller constructs the client without going through the constructor.
+	for key, value := range c.extraHeaders {
+		if IsReservedNaiveHeader(key) {
+			continue
+		}
+		headers[key] = value
+	}
+	return headers
 }
 
 func (c *NaiveClient) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
