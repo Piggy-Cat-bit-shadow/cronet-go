@@ -255,7 +255,7 @@ func newNaiveClientWithoutLibraryCheck(config NaiveClientOptions) (*NaiveClient,
 	}, nil
 }
 
-func (c *NaiveClient) Start() error {
+func (c *NaiveClient) Start() (err error) {
 	if !c.state.CompareAndSwap(uint32(clientStateCreated), uint32(clientStateStarting)) {
 		state := clientState(c.state.Load())
 		switch state {
@@ -292,6 +292,7 @@ func (c *NaiveClient) Start() error {
 			}
 			c.state.Store(uint32(clientStateClosed))
 			close(c.started)
+			err = startError
 		}
 	}()
 
@@ -306,6 +307,7 @@ func (c *NaiveClient) Start() error {
 			}
 			c.state.Store(uint32(clientStateClosed))
 			close(c.started)
+			err = startError
 		}
 	}()
 
