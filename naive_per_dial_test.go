@@ -101,3 +101,13 @@ func TestDialHeadersKeepsReservedHeadersOut(t *testing.T) {
 		t.Fatal("an ordinary extra header must still be forwarded")
 	}
 }
+
+func TestDialDestinationMapsTheFakeServerAddress(t *testing.T) {
+	client := &NaiveClient{serverAddress: M.ParseSocksaddrHostPort("proxy.example.com", 443)}
+	if got := client.dialDestination(fakeServerAddress.String(), 8443); got.String() != "proxy.example.com:8443" {
+		t.Fatalf("fake address was not mapped to the configured server: %s", got)
+	}
+	if got := client.dialDestination("203.0.113.9", 443); got.String() != "203.0.113.9:443" {
+		t.Fatalf("an ordinary destination was rewritten: %s", got)
+	}
+}

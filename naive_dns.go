@@ -27,7 +27,6 @@ import (
 
 	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/logger"
-	M "github.com/sagernet/sing/common/metadata"
 
 	mDNS "github.com/miekg/dns"
 )
@@ -85,6 +84,11 @@ const (
 	// budget, so the largest message this framing can carry is 65535 - 2.
 	maxDNSMessageSize = 65535 - 2
 )
+
+// fakeServerAddress is the address returned for the server name's A query. It is
+// never dialled: the TCP/UDP dialer callbacks map it back to the configured
+// server address and let that dialer resolve the name with the host's DNS policy.
+var fakeServerAddress = netip.AddrFrom4([4]byte{192, 0, 2, 1})
 
 func serveDNSPacketConn(ctx context.Context, conn net.PacketConn, resolver DNSResolverFunc) error {
 	defer conn.Close()
@@ -512,88 +516,31 @@ func filterIPHintsFromSVCB(svcb *mDNS.SVCB) {
 	svcb.Value = filtered
 }
 
-func wrapDNSResolverForServerRedirect(
-	resolver DNSResolverFunc,
-	serverName string,
-	serverAddress M.Socksaddr,
-) DNSResolverFunc {
+func wrapDNSResolverWithFakeServerAddress(resolver DNSResolverFunc, serverName string) DNSResolverFunc {
+	serverFQDN := mDNS.Fqdn(serverName)
 	return func(ctx context.Context, request *mDNS.Msg) *mDNS.Msg {
 		if len(request.Question) == 0 {
 			return resolver(ctx, request)
 		}
-
 		question := request.Question[0]
-		if question.Qtype != mDNS.TypeA && question.Qtype != mDNS.TypeAAAA {
+		if question.Qtype != mDNS.TypeA && question.Qtype != mDNS.TypeAAAA || !strings.EqualFold(question.Name, serverFQDN) {
 			return resolver(ctx, request)
 		}
-
-		queryName := strings.TrimSuffix(question.Name, ".")
-		if !strings.EqualFold(queryName, serverName) {
-			return resolver(ctx, request)
-		}
-
-		if serverAddress.IsIP() {
-			return synthesizeAddressResponse(request, serverAddress.Addr)
-		}
-
-		redirectedRequest := request.Copy()
-		redirectedRequest.Question[0].Name = mDNS.Fqdn(serverAddress.AddrString())
-
-		response := resolver(ctx, redirectedRequest)
-		if response != nil {
-			response = response.Copy()
-			response.Question = request.Question
-			rewriteAddressAnswerNames(response, serverAddress.AddrString(), serverName)
+		response := new(mDNS.Msg)
+		response.SetReply(request)
+		if question.Qtype == mDNS.TypeA {
+			response.Answer = append(response.Answer, &mDNS.A{
+				Hdr: mDNS.RR_Header{
+					Name:   question.Name,
+					Rrtype: mDNS.TypeA,
+					Class:  mDNS.ClassINET,
+					Ttl:    300,
+				},
+				A: fakeServerAddress.AsSlice(),
+			})
 		}
 		return response
 	}
-}
-
-func rewriteAddressAnswerNames(response *mDNS.Msg, fromDomain, toDomain string) {
-	fromDomain = strings.TrimSuffix(fromDomain, ".")
-	toDomain = strings.TrimSuffix(toDomain, ".")
-	toFQDN := toDomain + "."
-
-	for _, rr := range response.Answer {
-		hdrName := strings.TrimSuffix(rr.Header().Name, ".")
-		if strings.EqualFold(hdrName, fromDomain) {
-			rr.Header().Name = toFQDN
-		}
-	}
-}
-
-func synthesizeAddressResponse(request *mDNS.Msg, address netip.Addr) *mDNS.Msg {
-	response := new(mDNS.Msg)
-	response.SetReply(request)
-
-	if len(request.Question) == 0 {
-		return response
-	}
-
-	question := request.Question[0]
-	if question.Qtype == mDNS.TypeA && address.Is4() {
-		response.Answer = append(response.Answer, &mDNS.A{
-			Hdr: mDNS.RR_Header{
-				Name:   question.Name,
-				Rrtype: mDNS.TypeA,
-				Class:  mDNS.ClassINET,
-				Ttl:    300,
-			},
-			A: address.AsSlice(),
-		})
-	} else if question.Qtype == mDNS.TypeAAAA && address.Is6() {
-		response.Answer = append(response.Answer, &mDNS.AAAA{
-			Hdr: mDNS.RR_Header{
-				Name:   question.Name,
-				Rrtype: mDNS.TypeAAAA,
-				Class:  mDNS.ClassINET,
-				Ttl:    300,
-			},
-			AAAA: address.AsSlice(),
-		})
-	}
-
-	return response
 }
 
 // minimalSERVFAIL builds the smallest valid SERVFAIL reply to request.

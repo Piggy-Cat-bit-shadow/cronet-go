@@ -315,11 +315,7 @@ func (c *NaiveClient) Start() (err error) {
 	c.proxyCancel = proxyCancel
 
 	dnsServerAddress := M.ParseSocksaddrHostPort("127.0.0.1", 53)
-	dnsResolver := c.dnsResolver
-
-	if c.serverName != c.serverAddress.AddrString() {
-		dnsResolver = wrapDNSResolverForServerRedirect(dnsResolver, c.serverName, c.serverAddress)
-	}
+	dnsResolver := wrapDNSResolverWithFakeServerAddress(c.dnsResolver, c.serverName)
 
 	if c.echEnabled {
 		echQueryServerName := c.echQueryServerName
@@ -344,7 +340,7 @@ func (c *NaiveClient) Start() (err error) {
 			return fd
 		}
 
-		destination := M.ParseSocksaddrHostPort(address, port)
+		destination := c.dialDestination(address, port)
 		c.logger.DebugContext(c.ctx, "open TCP connection to ", destination)
 		conn, err := c.dialer.DialContext(proxyContext, N.NetworkTCP, destination)
 		if err != nil {
@@ -401,7 +397,7 @@ func (c *NaiveClient) Start() (err error) {
 			return fd, localAddress, localPort, dnsCancel
 		}
 
-		destination := M.ParseSocksaddrHostPort(address, port)
+		destination := c.dialDestination(address, port)
 		c.logger.DebugContext(c.ctx, "open UDP connection to ", destination)
 		conn, err := c.dialer.DialContext(proxyContext, N.NetworkUDP, destination)
 		if err != nil {
@@ -590,6 +586,19 @@ func (c *NaiveClient) DialEarly(ctx context.Context, destination M.Socksaddr) (N
 // hard guarantee must disable QUIC at the engine level instead.
 func (c *NaiveClient) DialEarlyWithQUIC(ctx context.Context, destination M.Socksaddr, forceQUIC bool) (NaiveConn, error) {
 	return c.dialEarly(ctx, destination, forceQUIC)
+}
+
+// dialDestination maps the fake address Chromium resolved for the server name
+// back to the configured server address. Handing the real address (possibly a
+// domain) to the dialer is what lets the host's DNS policy and dual-stack
+// scheduling resolve the server, instead of Chromium's single-address answer.
+func (c *NaiveClient) dialDestination(address string, port uint16) M.Socksaddr {
+	destination := M.ParseSocksaddrHostPort(address, port)
+	if destination.Addr == fakeServerAddress {
+		destination = c.serverAddress
+		destination.Port = port
+	}
+	return destination
 }
 
 func (c *NaiveClient) dialEarly(ctx context.Context, destination M.Socksaddr, forceQUIC bool) (NaiveConn, error) {

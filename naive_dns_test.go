@@ -580,3 +580,45 @@ func TestDNSBridgeDoesNotLogPerQuery(t *testing.T) {
 			strings.Join(offenders, "\n  "))
 	}
 }
+
+func TestFakeServerAddressWrapper(t *testing.T) {
+	forwarded := 0
+	upstream := func(_ context.Context, request *mDNS.Msg) *mDNS.Msg {
+		forwarded++
+		response := new(mDNS.Msg)
+		response.SetReply(request)
+		return response
+	}
+	wrapped := wrapDNSResolverWithFakeServerAddress(upstream, "proxy.example.com")
+
+	query := new(mDNS.Msg)
+	query.SetQuestion("proxy.example.com.", mDNS.TypeA)
+	response := wrapped(context.Background(), query)
+	if response == nil || len(response.Answer) != 1 {
+		t.Fatalf("expected one synthetic A answer, got %v", response)
+	}
+	answer, ok := response.Answer[0].(*mDNS.A)
+	if !ok || !answer.A.Equal(fakeServerAddress.AsSlice()) {
+		t.Fatalf("synthetic answer = %v, want %s", response.Answer[0], fakeServerAddress)
+	}
+	if forwarded != 0 {
+		t.Fatalf("the server name must not reach the upstream resolver (%d calls)", forwarded)
+	}
+
+	query6 := new(mDNS.Msg)
+	query6.SetQuestion("proxy.example.com.", mDNS.TypeAAAA)
+	response6 := wrapped(context.Background(), query6)
+	if response6 == nil || len(response6.Answer) != 0 {
+		t.Fatalf("AAAA must return an empty success, got %v", response6)
+	}
+	if forwarded != 0 {
+		t.Fatalf("AAAA for the server name must not reach the upstream resolver (%d calls)", forwarded)
+	}
+
+	other := new(mDNS.Msg)
+	other.SetQuestion("example.org.", mDNS.TypeA)
+	wrapped(context.Background(), other)
+	if forwarded != 1 {
+		t.Fatalf("unrelated names must be forwarded exactly once, got %d", forwarded)
+	}
+}
