@@ -21,6 +21,12 @@ on:
   pull_request:
     branches: [main, dev]
 
+# The publish job force-pushes the built libraries to the consuming branch. Without this block the
+# token is read-only for contents and the push fails with 403 - which is what happened on the first
+# four-target run: every build succeeded and the publish step could not write.
+permissions:
+  contents: write
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
