@@ -341,6 +341,7 @@ func (c *NaiveClient) Start() (err error) {
 		}
 
 		destination := c.dialDestination(address, port)
+
 		c.logger.DebugContext(c.ctx, "open TCP connection to ", destination)
 		conn, err := c.dialer.DialContext(proxyContext, N.NetworkTCP, destination)
 		if err != nil {
@@ -398,6 +399,7 @@ func (c *NaiveClient) Start() (err error) {
 		}
 
 		destination := c.dialDestination(address, port)
+
 		c.logger.DebugContext(c.ctx, "open UDP connection to ", destination)
 		conn, err := c.dialer.DialContext(proxyContext, N.NetworkUDP, destination)
 		if err != nil {

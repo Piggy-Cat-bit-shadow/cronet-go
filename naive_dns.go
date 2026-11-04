@@ -4,10 +4,6 @@ package cronet
 //
 // Priority: serverName (SNI) = ServerName config > ServerAddress
 //
-// A/AAAA queries for serverName:
-//   - If ServerAddress is a domain (different from serverName): redirect query to ServerAddress
-//   - If ServerAddress is an IP: return synthetic response (mismatched type returns empty SUCCESS)
-//
 // HTTPS queries for serverName (ECH):
 //   - If fixed ECHConfigList exists: return synthetic response immediately
 //   - Otherwise: forward query (priority: ECHQueryServerName > serverName)
