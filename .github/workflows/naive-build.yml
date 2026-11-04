@@ -697,6 +697,29 @@ jobs:
         with:
           path: artifacts/
 
+      - name: Every target this profile promises must have an artifact
+        # A run where one platform was cancelled and the others succeeded used to publish whatever it
+        # had: the merged tree still contains every lib directory (the unbuilt ones keep the previous
+        # commit's binaries), so the consuming branch would advertise a new version whose Apple
+        # binaries are the old ones. Publishing is the one step that must not tolerate a partial
+        # matrix.
+        run: |
+          set -uo pipefail
+          case "${{ inputs.profile || 'main' }}" in
+            main) expected="cronet-android-arm64 cronet-windows-amd64 cronet-darwin-arm64 cronet-ios-arm64" ;;
+            *) echo "full profile: not asserting a fixed set"; exit 0 ;;
+          esac
+          missing=""
+          for name in $expected; do
+            if [ ! -d "artifacts/$name" ]; then
+              missing="$missing $name"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "FAIL: the profile promises these artifacts and they are missing:$missing" >&2
+            exit 1
+          fi
+
       - name: Merge artifacts
         run: |
           for dir in artifacts/cronet-*/; do
