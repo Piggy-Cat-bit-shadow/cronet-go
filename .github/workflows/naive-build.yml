@@ -7,6 +7,15 @@ on:
         description: 'Release tag'
         type: string
         required: false
+      profile:
+        description: 'main = the four targets JiejieBox ships (ios/arm64, darwin/arm64, windows/amd64, android/arm64); full = every target'
+        type: choice
+        options: [main, full]
+        default: main
+      publish:
+        description: 'Publish the built libraries to the consuming branch (manual runs publish only when this is on)'
+        type: boolean
+        default: false
   push:
     branches: [main, dev]
   pull_request:
@@ -17,7 +26,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  plan:
+    # What this run builds.
+    #
+    # Push builds the four targets the product actually links: ios/arm64, darwin/arm64,
+    # windows/amd64 and android/arm64. The other twenty-five architectures are free to break against
+    # an external mirror (they did, five times in one night, against snapshot.debian.org) and each
+    # failure cancels its siblings - so the four that matter waited behind the ones nobody consumes.
+    # They are still buildable: dispatch with profile=full.
+    runs-on: ubuntu-22.04
+    outputs:
+      profile: ${{ steps.plan.outputs.profile }}
+      windows: ${{ steps.plan.outputs.windows }}
+      android: ${{ steps.plan.outputs.android }}
+      darwin: ${{ steps.plan.outputs.darwin }}
+    steps:
+      - id: plan
+        run: |
+          set -euo pipefail
+          profile="${{ inputs.profile }}"
+          if [ -z "$profile" ]; then profile=main; fi
+          echo "profile=$profile" >> "$GITHUB_OUTPUT"
+          if [ "$profile" = full ]; then
+            echo 'windows={"arch":["amd64","arm64"]}' >> "$GITHUB_OUTPUT"
+            echo 'android={"include":[{"arch":"arm64","cc":"aarch64-linux-android23-clang"},{"arch":"amd64","cc":"x86_64-linux-android23-clang"},{"arch":"arm","cc":"armv7a-linux-androideabi23-clang"},{"arch":"386","cc":"i686-linux-android23-clang"}]}' >> "$GITHUB_OUTPUT"
+            echo 'darwin={"include":[{"target":"darwin/amd64","name":"darwin-amd64"},{"target":"darwin/arm64","name":"darwin-arm64"},{"target":"ios/arm64","name":"ios-arm64"},{"target":"ios/arm64/simulator","name":"ios-arm64-simulator"},{"target":"ios/amd64","name":"ios-amd64-simulator"},{"target":"tvos/arm64","name":"tvos-arm64"},{"target":"tvos/arm64/simulator","name":"tvos-arm64-simulator"},{"target":"tvos/amd64","name":"tvos-amd64-simulator"}]}' >> "$GITHUB_OUTPUT"
+          else
+            echo 'windows={"arch":["amd64"]}' >> "$GITHUB_OUTPUT"
+            echo 'android={"include":[{"arch":"arm64","cc":"aarch64-linux-android23-clang"}]}' >> "$GITHUB_OUTPUT"
+            echo 'darwin={"include":[{"target":"darwin/arm64","name":"darwin-arm64"},{"target":"ios/arm64","name":"ios-arm64"}]}' >> "$GITHUB_OUTPUT"
+          fi
   linux:
+    needs: plan
+    if: needs.plan.outputs.profile == 'full'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -125,29 +166,11 @@ jobs:
             lib_*_cgo.go
 
   darwin:
+    needs: plan
     runs-on: macos-26
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: darwin/amd64
-            name: darwin-amd64
-          - target: darwin/arm64
-            name: darwin-arm64
-          # iOS
-          - target: ios/arm64
-            name: ios-arm64
-          - target: ios/arm64/simulator
-            name: ios-arm64-simulator
-          - target: ios/amd64
-            name: ios-amd64-simulator
-          # tvOS
-          - target: tvos/arm64
-            name: tvos-arm64
-          - target: tvos/arm64/simulator
-            name: tvos-arm64-simulator
-          - target: tvos/amd64
-            name: tvos-amd64-simulator
+      matrix: ${{ fromJSON(needs.plan.outputs.darwin) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -205,13 +228,13 @@ jobs:
             lib_*_cgo.go
 
   windows:
+    needs: plan
     runs-on: windows-2022
     env:
       SCCACHE_ARM64_VERSION: 0.12.0
     strategy:
       fail-fast: false
-      matrix:
-        arch: [amd64, arm64]
+      matrix: ${{ fromJSON(needs.plan.outputs.windows) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -298,19 +321,11 @@ jobs:
             include_cgo.go
 
   android:
+    needs: plan
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            cc: aarch64-linux-android23-clang
-          - arch: amd64
-            cc: x86_64-linux-android23-clang
-          - arch: arm
-            cc: armv7a-linux-androideabi23-clang
-          - arch: "386"
-            cc: i686-linux-android23-clang
+      matrix: ${{ fromJSON(needs.plan.outputs.android) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -374,6 +389,8 @@ jobs:
             lib_*_cgo.go
 
   linux-musl:
+    needs: plan
+    if: needs.plan.outputs.profile == 'full'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -468,8 +485,10 @@ jobs:
             lib_*_cgo.go
 
   integration-test:
-    if: github.event_name != 'workflow_dispatch'
-    needs: [linux, darwin, windows]
+    # Full-profile only: its matrix consumes the Linux and Intel artifacts, which the daily profile
+    # does not build.
+    if: needs.plan.outputs.profile == 'full'
+    needs: [plan, linux, darwin, windows]
     strategy:
       fail-fast: false
       matrix:
@@ -649,8 +668,14 @@ jobs:
           if-no-files-found: warn
 
   publish:
-    if: github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip publish]')
-    needs: [linux, linux-musl, darwin, windows, android, integration-test]
+    # A push publishes the daily profile. A manual run publishes only when asked: a dispatch that
+    # silently moved the consuming branch would be a build that changes other repositories as a
+    # side effect.
+    if: |
+      always() && !cancelled() && !contains(needs.*.result, 'failure')
+      && (github.event_name == 'push' || inputs.publish)
+      && !contains(github.event.head_commit.message, '[skip publish]')
+    needs: [plan, linux, linux-musl, darwin, windows, android, integration-test]
     runs-on: ubuntu-22.04
     env:
       TARGET_BRANCH: ${{ github.ref_name == 'main' && 'go' || 'go_dev' }}
@@ -682,8 +707,9 @@ jobs:
         run: go run ./cmd/build-naive publish --branch ${{ env.TARGET_BRANCH }}
 
   release:
-    needs: [linux, windows]
-    if: github.event_name == 'workflow_dispatch'
+    # Consumes the Linux artifacts, which only the full profile builds.
+    needs: [plan, linux, windows]
+    if: github.event_name == 'workflow_dispatch' && needs.plan.outputs.profile == 'full'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
