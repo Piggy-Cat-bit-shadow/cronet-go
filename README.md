@@ -10,13 +10,16 @@
 | 本仓库 `main` | 开发源码、Go 绑定、自定义拨号与构建脚本 |
 | 本仓库 `go` | 已发布的 Go 模块和原生库；供消费方锁定版本，不用于日常开发 |
 | [naiveproxy](https://github.com/Piggy-Cat-bit-shadow/naiveproxy) 子模块 | 定制的 Chromium/Cronet 源码；具体提交以本仓库的 gitlink 为准 |
-| [cronet-go-build](https://github.com/Piggy-Cat-bit-shadow/cronet-go-build) | 历史 CI 辅助镜像；原仓 Actions 已恢复，待现有任务结束后归档 |
+| [cronet-go-build](https://github.com/Piggy-Cat-bit-shadow/cronet-go-build) | 历史 CI 辅助镜像；已停用并归档为只读，不再构建或发布 |
 
 **GitHub Actions 已于 2026-11-05 手动启用并确认能启动任务；日常构建统一在[本仓 Actions](https://github.com/Piggy-Cat-bit-shadow/cronet-go/actions)运行。**
 
 **消费方应引用本仓库，不要引用 `cronet-go-build`。** 模块声明仍沿用
 `github.com/sagernet/cronet-go`，消费方用精确的 `replace` 指向本 fork；
 `lib` 子模块需要逐个列出，Go 不支持 `lib/*` 通配符替换。
+
+清理记录：`cronet-go-build`（CI 镜像）与 `actions-probe`（排障仓）均已归档为只读，不再参与构建或发布；
+删除动作待具备 `delete_repo` 权限后执行。两者不含本仓库之外的源码，归档前已保存完整 refs 与排障工作流原文。
 
 当前维护 Chromium `154.0.8037.49`，已适配 NaiveProxy `v154.0.8037.49-5`
 的证书封锁与 QUIC 补丁。原生库此次更新覆盖 Linux/amd64、Windows/amd64、
