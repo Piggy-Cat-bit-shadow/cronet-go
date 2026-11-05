@@ -991,6 +991,8 @@ jobs:
         run: |
           set -euo pipefail
           export GOMODCACHE="$RUNNER_TEMP/consume-cache"
+          export GOFLAGS=-mod=mod
+          cd "$RUNNER_TEMP/consume"
           library_directory=$(go list -m -f '{{.Dir}}' "${MODULE}/lib/linux_amd64")
           test -s "${library_directory}/libcronet.a"
           file "${library_directory}/libcronet.so" | tee "$GITHUB_WORKSPACE/libraries.txt"
