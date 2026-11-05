@@ -8,7 +8,7 @@ on:
         type: string
         required: false
       profile:
-        description: 'main = the four targets JiejieBox ships (ios/arm64, darwin/arm64, windows/amd64, android/arm64); full = every target'
+        description: 'main = the five targets JiejieBox ships (linux/amd64, windows/amd64, android/arm64, darwin/arm64, ios/arm64); full = every target'
         type: choice
         options: [main, full]
         default: main
@@ -35,14 +35,15 @@ jobs:
   plan:
     # What this run builds.
     #
-    # Push builds the four targets the product actually links: ios/arm64, darwin/arm64,
-    # windows/amd64 and android/arm64. The other twenty-five architectures are free to break against
-    # an external mirror (they did, five times in one night, against snapshot.debian.org) and each
-    # failure cancels its siblings - so the four that matter waited behind the ones nobody consumes.
+    # Push builds the five targets the product actually links: linux/amd64 (glibc), windows/amd64,
+    # android/arm64, darwin/arm64 and ios/arm64. The other architectures are free to break against an
+    # external mirror (they did, five times in one night, against snapshot.debian.org) and each
+    # failure cancels its siblings - so the five that matter waited behind the ones nobody consumes.
     # They are still buildable: dispatch with profile=full.
     runs-on: ubuntu-22.04
     outputs:
       profile: ${{ steps.plan.outputs.profile }}
+      linux: ${{ steps.plan.outputs.linux }}
       windows: ${{ steps.plan.outputs.windows }}
       android: ${{ steps.plan.outputs.android }}
       darwin: ${{ steps.plan.outputs.darwin }}
@@ -54,22 +55,24 @@ jobs:
           if [ -z "$profile" ]; then profile=main; fi
           echo "profile=$profile" >> "$GITHUB_OUTPUT"
           if [ "$profile" = full ]; then
+            echo 'linux={"arch":["amd64","arm64","386","arm","loong64","mipsle","mips64le","riscv64"]}' >> "$GITHUB_OUTPUT"
             echo 'windows={"arch":["amd64","arm64"]}' >> "$GITHUB_OUTPUT"
             echo 'android={"include":[{"arch":"arm64","cc":"aarch64-linux-android23-clang"},{"arch":"amd64","cc":"x86_64-linux-android23-clang"},{"arch":"arm","cc":"armv7a-linux-androideabi23-clang"},{"arch":"386","cc":"i686-linux-android23-clang"}]}' >> "$GITHUB_OUTPUT"
             echo 'darwin={"include":[{"target":"darwin/amd64","name":"darwin-amd64"},{"target":"darwin/arm64","name":"darwin-arm64"},{"target":"ios/arm64","name":"ios-arm64"},{"target":"ios/arm64/simulator","name":"ios-arm64-simulator"},{"target":"ios/amd64","name":"ios-amd64-simulator"},{"target":"tvos/arm64","name":"tvos-arm64"},{"target":"tvos/arm64/simulator","name":"tvos-arm64-simulator"},{"target":"tvos/amd64","name":"tvos-amd64-simulator"}]}' >> "$GITHUB_OUTPUT"
           else
+            echo 'linux={"arch":["amd64"]}' >> "$GITHUB_OUTPUT"
             echo 'windows={"arch":["amd64"]}' >> "$GITHUB_OUTPUT"
             echo 'android={"include":[{"arch":"arm64","cc":"aarch64-linux-android23-clang"}]}' >> "$GITHUB_OUTPUT"
             echo 'darwin={"include":[{"target":"darwin/arm64","name":"darwin-arm64"},{"target":"ios/arm64","name":"ios-arm64"}]}' >> "$GITHUB_OUTPUT"
           fi
   linux:
+    # The glibc family. The daily profile builds only amd64 - the Linux target the product ships;
+    # musl and the other architectures stay behind profile=full.
     needs: plan
-    if: needs.plan.outputs.profile == 'full'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
-      matrix:
-        arch: [amd64, arm64, "386", arm, loong64, mipsle, mips64le, riscv64]
+      matrix: ${{ fromJSON(needs.plan.outputs.linux) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -683,6 +686,9 @@ jobs:
       && !contains(github.event.head_commit.message, '[skip publish]')
     needs: [plan, linux, linux-musl, darwin, windows, android, integration-test]
     runs-on: ubuntu-22.04
+    outputs:
+      branch: ${{ steps.published.outputs.branch }}
+      commit: ${{ steps.published.outputs.commit }}
     env:
       TARGET_BRANCH: ${{ github.ref_name == 'main' && 'go' || 'go_dev' }}
     steps:
@@ -697,28 +703,150 @@ jobs:
         with:
           path: artifacts/
 
-      - name: Every target this profile promises must have an artifact
+      - name: Every target this profile promises must be a real artifact
         # A run where one platform was cancelled and the others succeeded used to publish whatever it
         # had: the merged tree still contains every lib directory (the unbuilt ones keep the previous
         # commit's binaries), so the consuming branch would advertise a new version whose Apple
         # binaries are the old ones. Publishing is the one step that must not tolerate a partial
-        # matrix.
+        # matrix - and an artifact directory is not evidence on its own: each promised target has to
+        # carry a native library of the architecture it names, and all of them have to come from one
+        # Chromium baseline.
         run: |
-          set -uo pipefail
-          case "${{ inputs.profile || 'main' }}" in
-            main) expected="cronet-android-arm64 cronet-windows-amd64 cronet-darwin-arm64 cronet-ios-arm64" ;;
-            *) echo "full profile: not asserting a fixed set"; exit 0 ;;
-          esac
-          missing=""
-          for name in $expected; do
-            if [ ! -d "artifacts/$name" ]; then
-              missing="$missing $name"
-            fi
-          done
-          if [ -n "$missing" ]; then
-            echo "FAIL: the profile promises these artifacts and they are missing:$missing" >&2
-            exit 1
-          fi
+          set -euo pipefail
+          echo "source commit: ${GITHUB_SHA}"
+          echo "naiveproxy:    $(git ls-tree HEAD naiveproxy | awk '{print $3}')"
+          python3 - "${{ inputs.profile || 'main' }}" <<'PY'
+          import hashlib
+          import os
+          import struct
+          import sys
+
+          profile = sys.argv[1]
+
+          # artifact, native library directory, file kind, machine, files that must be present
+          if profile == "main":
+              promises = [
+                  ("cronet-linux-amd64", "lib/linux_amd64", "elf", 62, ["libcronet.a", "libcronet.so"]),
+                  ("cronet-windows-amd64", "lib/windows_amd64", "pe", 0x8664, ["libcronet.dll"]),
+                  ("cronet-darwin-arm64", "lib/darwin_arm64", "macho", 0x0100000C, ["libcronet.a"]),
+                  ("cronet-ios-arm64", "lib/ios_arm64", "macho", 0x0100000C, ["libcronet.a"]),
+                  ("cronet-android-arm64", "lib/android_arm64", "elf", 183, ["libcronet.a"]),
+              ]
+          else:
+              print("full profile: the matrix is the promise, not a fixed platform list")
+              raise SystemExit(0)
+
+          failures = []
+          versions = {}
+
+
+          def ar_members(data):
+              # ar(1): "!<arch>\n" then 60-byte headers, member data padded to an even offset.
+              if not data.startswith(b"!<arch>\n"):
+                  return
+              offset = 8
+              while offset + 60 <= len(data):
+                  header = data[offset:offset + 60]
+                  try:
+                      size = int(header[48:58].decode().strip() or "0")
+                  except ValueError:
+                      return
+                  start = offset + 60
+                  body = data[start:start + size]
+                  # BSD ar (Apple's libtool) keeps long names in the first bytes of the member and
+                  # counts them in the member size; GNU ar does not.
+                  if header[0:3] == b"#1/":
+                      try:
+                          name_length = int(header[3:16].decode().strip())
+                      except ValueError:
+                          name_length = 0
+                      body = body[name_length:]
+                  yield body
+                  offset = start + size + (size & 1)
+
+
+          def machine_of(kind, data):
+              if kind == "elf":
+                  if len(data) < 20 or data[:4] != b"\x7fELF":
+                      return None
+                  return struct.unpack_from("<H", data, 18)[0]
+              if kind == "macho":
+                  if len(data) < 8 or data[:4] not in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe"):
+                      return None
+                  return struct.unpack_from("<I", data, 4)[0]
+              if kind == "pe":
+                  if len(data) < 64 or data[:2] != b"MZ":
+                      return None
+                  pe = struct.unpack_from("<I", data, 0x3C)[0]
+                  if data[pe:pe + 4] != b"PE\0\0":
+                      return None
+                  return struct.unpack_from("<H", data, pe + 4)[0]
+              return None
+
+
+          def identify(kind, data):
+              found = machine_of(kind, data)
+              if found is not None:
+                  return found
+              if kind == "pe":
+                  return None
+              for member in ar_members(data) or []:
+                  found = machine_of(kind, member)
+                  if found is not None:
+                      return found
+              return None
+
+
+          for artifact, directory, kind, machine, files in promises:
+              root = os.path.join("artifacts", artifact)
+              if not os.path.isdir(root):
+                  failures.append(f"{artifact}: the job produced no artifact in this run")
+                  continue
+              for name in files:
+                  path = os.path.join(root, directory, name)
+                  if not os.path.isfile(path):
+                      failures.append(f"{artifact}: {path} is missing")
+                      continue
+                  with open(path, "rb") as handle:
+                      data = handle.read()
+                  if len(data) < 1024 * 1024:
+                      failures.append(f"{artifact}: {path} is only {len(data)} bytes")
+                      continue
+                  found = identify(kind, data)
+                  if found != machine:
+                      reported = "0x%x" % found if found is not None else "unknown"
+                      failures.append(f"{artifact}: {path} is machine {reported}, expected {kind} 0x{machine:x}")
+                      continue
+                  print(f"{artifact}: {path} {len(data)} bytes sha256 {hashlib.sha256(data).hexdigest()}")
+              version_file = None
+              for name in ("libcronet_cgo.go", "libcronet.go"):
+                  candidate = os.path.join(root, directory, name)
+                  if os.path.isfile(candidate):
+                      version_file = candidate
+                      break
+              if version_file is None:
+                  failures.append(f"{artifact}: {directory} has no generated version file")
+                  continue
+              with open(version_file, encoding="utf-8") as handle:
+                  for line in handle:
+                      if line.startswith("const Version = "):
+                          versions[artifact] = line.split('"')[1]
+                          break
+                  else:
+                      failures.append(f"{artifact}: {version_file} has no Version constant")
+
+          if len(set(versions.values())) > 1:
+              failures.append(f"the artifacts are not from one Chromium baseline: {versions}")
+          elif versions:
+              print(f"Chromium baseline: {next(iter(versions.values()))}")
+
+          if failures:
+              print("FAIL:", file=sys.stderr)
+              for failure in failures:
+                  print(f"  - {failure}", file=sys.stderr)
+              raise SystemExit(1)
+          print("every promised target is present, native, and of the expected architecture")
+          PY
 
       - name: Merge artifacts
         run: |
@@ -734,6 +862,148 @@ jobs:
 
       - name: Publish
         run: go run ./cmd/build-naive publish --branch ${{ env.TARGET_BRANCH }}
+
+      - name: Record the published revision
+        id: published
+        run: |
+          set -euo pipefail
+          commit=$(git ls-remote origin "refs/heads/${TARGET_BRANCH}" | cut -f1)
+          if [ -z "$commit" ]; then
+            echo "FAIL: ${TARGET_BRANCH} does not exist after publish" >&2
+            exit 1
+          fi
+          echo "branch=${TARGET_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+          echo "published ${TARGET_BRANCH} at ${commit}"
+
+  consume:
+    # Building a library is not the same as shipping it. This job consumes the branch the publish step
+    # just wrote, starting from an empty module cache: it resolves the modules by commit the way a
+    # consumer does, then links and runs the Linux amd64 artifact through the module system. The other
+    # four daily targets are exercised by their own build jobs (darwin/arm64 and windows/amd64 run the
+    # engine, android/arm64 and ios/arm64 are linked), and linux/amd64 is the one this profile newly
+    # added - so it is the one that gets an end-to-end consumer check.
+    needs: [plan, publish]
+    if: |
+      always() && !cancelled()
+      && needs.publish.result == 'success'
+      && needs.plan.outputs.profile == 'main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ^1.24
+
+      - name: Identify the module path and the repository that serves it
+        id: identity
+        run: |
+          set -euo pipefail
+          module=$(sed -n 's/^module //p' go.mod)
+          origin="github.com/${{ github.repository }}"
+          if [ -z "$module" ]; then
+            echo "FAIL: cannot read the module path from go.mod" >&2
+            exit 1
+          fi
+          echo "module=${module}" >> "$GITHUB_OUTPUT"
+          echo "origin=${origin}" >> "$GITHUB_OUTPUT"
+          echo "consuming ${module} from ${origin}"
+
+      - name: Resolve the published modules with an empty cache
+        env:
+          PUBLISHED_COMMIT: ${{ needs.publish.outputs.commit }}
+          MODULE: ${{ steps.identity.outputs.module }}
+          ORIGIN: ${{ steps.identity.outputs.origin }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PUBLISHED_COMMIT" ]; then
+            echo "FAIL: the publish job reported no commit" >&2
+            exit 1
+          fi
+          export GOMODCACHE="$RUNNER_TEMP/consume-cache"
+          export GOPROXY=direct GOSUMDB=off GOFLAGS=-mod=mod GIT_TERMINAL_PROMPT=0
+          # The published go.mod keeps the upstream module paths, and consumers point them at the
+          # repository that actually has the commits. Doing the same here is what makes this check
+          # meaningful: nothing is read from the publisher's module cache.
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://${ORIGIN}.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://${MODULE}"
+
+          work="$RUNNER_TEMP/consume"
+          mkdir -p "$work"
+          cd "$work"
+          go mod init consume
+          go get "${MODULE}@${PUBLISHED_COMMIT}" "${MODULE}/all@${PUBLISHED_COMMIT}" "${MODULE}/lib/linux_amd64@${PUBLISHED_COMMIT}"
+          go list -m all | tee "$GITHUB_WORKSPACE/consumed-modules.txt"
+
+          cat > main.go <<EOF
+          package main
+
+          import (
+          	"fmt"
+          	"os"
+
+          	cronet "${MODULE}"
+          	_ "${MODULE}/lib/linux_amd64"
+          )
+
+          func main() {
+          	params := cronet.NewEngineParams()
+          	params.SetUserAgent("cronet-go-consume-check")
+          	defer params.Destroy()
+
+          	engine := cronet.NewEngine()
+          	if result := engine.StartWithParams(params); result != cronet.ResultSuccess {
+          		fmt.Fprintf(os.Stderr, "engine start failed: %v\n", result)
+          		os.Exit(1)
+          	}
+          	defer engine.Destroy()
+          	defer engine.Shutdown()
+
+          	fmt.Println("engine version:", engine.Version())
+          }
+          EOF
+
+      - name: Run the published Linux amd64 library through purego
+        env:
+          MODULE: ${{ steps.identity.outputs.module }}
+        run: |
+          set -euo pipefail
+          export GOMODCACHE="$RUNNER_TEMP/consume-cache"
+          export GOFLAGS=-mod=mod GIT_TERMINAL_PROMPT=0
+          cd "$RUNNER_TEMP/consume"
+          library_directory=$(go list -m -f '{{.Dir}}' "${MODULE}/lib/linux_amd64")
+          cp "${library_directory}/libcronet.so" .
+          CGO_ENABLED=0 go build -tags with_purego -o consume-purego .
+          LD_LIBRARY_PATH="$PWD" ./consume-purego | tee "$GITHUB_WORKSPACE/purego-version.txt"
+          grep -q "engine version: " "$GITHUB_WORKSPACE/purego-version.txt"
+
+      - name: Link the published static library into a cgo program
+        env:
+          MODULE: ${{ steps.identity.outputs.module }}
+        run: |
+          set -euo pipefail
+          export GOMODCACHE="$RUNNER_TEMP/consume-cache"
+          export GOFLAGS=-mod=mod GIT_TERMINAL_PROMPT=0
+          cd "$RUNNER_TEMP/consume"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld
+          CGO_ENABLED=1 CC=clang CGO_LDFLAGS="-fuse-ld=lld" go build -o consume-cgo .
+          ./consume-cgo | tee "$GITHUB_WORKSPACE/cgo-version.txt"
+          grep -q "engine version: " "$GITHUB_WORKSPACE/cgo-version.txt"
+
+      - name: Upload the consumption log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: consume-linux-amd64
+          path: |
+            consumed-modules.txt
+            purego-version.txt
+            cgo-version.txt
+          if-no-files-found: warn
 
   release:
     # Consumes the Linux artifacts, which only the full profile builds.
