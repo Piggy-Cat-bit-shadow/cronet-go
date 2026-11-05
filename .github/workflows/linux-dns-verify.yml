@@ -1,0 +1,74 @@
+name: Linux DNS verification
+
+# On-demand check for the Linux DNS bridge reply path. The daily profile cannot see it: its
+# Linux job only starts an engine, while the bridge is what the CONNECT path depends on for
+# resolving the proxy name. The unit tests drive the anonymous AF_UNIX/SOCK_DGRAM socketpair
+# the client hands to serveDNSPacketConn, and the integration tests run the CONNECT and DNS
+# paths against the published native library with the candidate Go code.
+#
+# Dispatch only - a debugging aid for changes to naive_dns.go, not a per-push job.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dns:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ^1.24
+
+      - name: Unit tests for the packet bridge
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 go test -tags with_purego -v -count=1 -timeout=5m \
+            -run 'TestDNSPacketConnAnswersOnAnonymousSocketpair|TestWritePacketConnWithoutAddress|TestDNSPacketConnCountsFailedReplies|TestUDPBridgeAnswersAndTruncates|TestBridgeNeverDropsSilentlyForAValidQuery' \
+            . > "$GITHUB_WORKSPACE/unit.log" 2>&1 || {
+              tail -n 60 "$GITHUB_WORKSPACE/unit.log"
+              exit 1
+            }
+          grep -E '^(--- (PASS|FAIL|SKIP)|PASS|FAIL|ok )' "$GITHUB_WORKSPACE/unit.log"
+
+      - name: Check out the published native libraries
+        uses: actions/checkout@v4
+        with:
+          ref: go
+          path: published
+          fetch-depth: 1
+
+      - name: Integration tests through the published library
+        working-directory: test
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/published/lib/linux_amd64
+          CRONET_TEST_ARTIFACT_DIR: ${{ github.workspace }}/test-artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p "$CRONET_TEST_ARTIFACT_DIR"
+          if ! CGO_ENABLED=0 go test -tags with_purego -v -count=1 -timeout=20m \
+              -run 'TestNaiveCustomDialer$|TestNaiveCustomDialerUDPLoopback$|TestNaivePipeProxy$|TestDNS' \
+              . > "$CRONET_TEST_ARTIFACT_DIR/integration.log" 2>&1; then
+            tail -n 150 "$CRONET_TEST_ARTIFACT_DIR/integration.log"
+            echo "--- dial targets observed by the custom dialer:"
+            grep -E 'dial target|must dial' "$CRONET_TEST_ARTIFACT_DIR/integration.log" || true
+            exit 1
+          fi
+          grep -E '^(--- (PASS|FAIL|SKIP)|PASS|FAIL|ok )' "$CRONET_TEST_ARTIFACT_DIR/integration.log"
+
+      - name: Upload the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-dns-verification
+          path: |
+            unit.log
+            test-artifacts/
+          if-no-files-found: warn

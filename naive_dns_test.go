@@ -622,3 +622,112 @@ func TestFakeServerAddressWrapper(t *testing.T) {
 		t.Fatalf("unrelated names must be forwarded exactly once, got %d", forwarded)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Replying on a connection whose peer has no address
+// ---------------------------------------------------------------------------
+
+// scriptedPacketConn reports a nil peer address on its first read - the shape of the
+// anonymous AF_UNIX SOCK_DGRAM socketpair the Linux client uses - and then ends the
+// loop. Writes are recorded, or failed with writeErr.
+type scriptedPacketConn struct {
+	query     []byte
+	read      bool
+	writeErr  error
+	written   [][]byte
+	localAddr net.Addr
+}
+
+func (c *scriptedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	if c.read {
+		return 0, nil, io.EOF
+	}
+	c.read = true
+	return copy(p, c.query), nil, nil
+}
+
+func (c *scriptedPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
+	c.written = append(c.written, append([]byte(nil), p...))
+	return len(p), nil
+}
+
+func (c *scriptedPacketConn) Close() error                     { return nil }
+func (c *scriptedPacketConn) LocalAddr() net.Addr              { return c.localAddr }
+func (c *scriptedPacketConn) SetDeadline(time.Time) error      { return nil }
+func (c *scriptedPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *scriptedPacketConn) SetWriteDeadline(time.Time) error { return nil }
+
+// connectedScriptedPacketConn adds the net.Conn shape, so a write without an address
+// has a destination - the connected endpoint of the socketpair.
+type connectedScriptedPacketConn struct {
+	*scriptedPacketConn
+}
+
+func (c *connectedScriptedPacketConn) Read(p []byte) (int, error) { return 0, io.EOF }
+
+func (c *connectedScriptedPacketConn) Write(p []byte) (int, error) {
+	return c.scriptedPacketConn.WriteTo(p, nil)
+}
+
+func (c *connectedScriptedPacketConn) RemoteAddr() net.Addr {
+	return c.scriptedPacketConn.localAddr
+}
+
+// TestWritePacketConnWithoutAddressWritesOnTheConnection pins the fix for the Linux
+// socketpair: with no peer address the reply goes through Write on the connected
+// endpoint. The bound WriteTo path would aim it at a nil address, which UnixConn
+// rejects with EINVAL - the defect that kept the bridge silent on Linux.
+func TestWritePacketConnWithoutAddressWritesOnTheConnection(t *testing.T) {
+	base := &scriptedPacketConn{}
+	if err := writePacketConnWithoutAddress(&connectedScriptedPacketConn{base}, []byte("reply")); err != nil {
+		t.Fatalf("a write without an address must succeed on a connected datagram socket: %v", err)
+	}
+	if len(base.written) != 1 || string(base.written[0]) != "reply" {
+		t.Fatalf("the reply must be written exactly once on the connection, got %q", base.written)
+	}
+
+	sentinel := errors.New("write failed")
+	failing := &connectedScriptedPacketConn{&scriptedPacketConn{writeErr: sentinel}}
+	if err := writePacketConnWithoutAddress(failing, []byte("reply")); !errors.Is(err, sentinel) {
+		t.Fatalf("a write error must be reported, got %v", err)
+	}
+}
+
+// TestWritePacketConnWithoutAddressRefusesAListener is the other half of the rule: a
+// connection that only implements PacketConn has no destination when its peer is
+// unknown, and pretending otherwise would turn "destination address required" into a
+// silent no-op.
+func TestWritePacketConnWithoutAddressRefusesAListener(t *testing.T) {
+	if err := writePacketConnWithoutAddress(&scriptedPacketConn{}, []byte("reply")); err == nil {
+		t.Fatal("a packet connection with no peer address and no Write must be rejected")
+	}
+}
+
+// TestDNSPacketConnCountsFailedReplies keeps the per-query write error observable.
+// The bridge does not log per query on purpose; the counter is what a test - or a
+// future periodic summary - can read instead.
+func TestDNSPacketConnCountsFailedReplies(t *testing.T) {
+	sentinel := errors.New("write failed")
+	base := &scriptedPacketConn{writeErr: sentinel}
+	conn := &connectedScriptedPacketConn{base}
+	query := new(mDNS.Msg)
+	query.SetQuestion("example.com.", mDNS.TypeA)
+	packed, err := query.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.query = packed
+
+	before := dnsReplyFailures.Load()
+	_ = serveDNSPacketConn(context.Background(), conn, func(ctx context.Context, request *mDNS.Msg) *mDNS.Msg {
+		response := new(mDNS.Msg)
+		response.SetReply(request)
+		return response
+	})
+	if failed := dnsReplyFailures.Load() - before; failed != 1 {
+		t.Fatalf("a failed reply must be counted once, got %d", failed)
+	}
+}

@@ -126,10 +126,15 @@ type trackingDialer struct {
 	underlying N.Dialer
 	dialCount  atomic.Int64
 	wrapConn   bool // if true, wrap connections to force fallback path
+	targetsMu  sync.Mutex
+	targets    []M.Socksaddr // every destination the engine asked the host dialer for
 }
 
 func (d *trackingDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	d.dialCount.Add(1)
+	d.targetsMu.Lock()
+	d.targets = append(d.targets, destination)
+	d.targetsMu.Unlock()
 	conn, err := d.underlying.DialContext(ctx, network, destination)
 	if err != nil {
 		return nil, err
@@ -138,6 +143,13 @@ func (d *trackingDialer) DialContext(ctx context.Context, network string, destin
 		return &wrappedConn{Conn: conn}, nil
 	}
 	return conn, nil
+}
+
+// dialedTargets returns a copy of the destinations the engine asked for.
+func (d *trackingDialer) dialedTargets() []M.Socksaddr {
+	d.targetsMu.Lock()
+	defer d.targetsMu.Unlock()
+	return append([]M.Socksaddr(nil), d.targets...)
 }
 
 func (d *trackingDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
@@ -187,8 +199,77 @@ func TestNaiveCustomDialer(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, testData, buf)
 
-	// Verify dialer was called (check after I/O since connection is established lazily)
-	require.Greater(t, dialer.dialCount.Load(), int64(0), "custom dialer should have been called")
+	// Verify the engine dialled the configured server and not a resolved address.
+	//
+	// This is the assertion the Linux DNS defect would have tripped: when the bridge
+	// failed to answer, Chromium resolved the server name through the system resolver
+	// and dialled 172.66.157.237:10443 instead of 127.0.0.1:10443.
+	requireDialedOnlyTheConfiguredServer(t, dialer)
+}
+
+// requireDialedOnlyTheConfiguredServer pins the dial target of the naive client.
+//
+// The client resolves the server name through the in-process DNS bridge to the fake
+// address, and the dialer maps that back to the configured server. Every connection the
+// engine opens to the proxy port must therefore be the server itself - 172.66.157.237:10443
+// is what the Linux DNS defect produced instead.
+//
+// Dials to other ports are not part of this assertion: the engine's own resolver transport
+// (DNS over TCP to the host's nameserver) also goes through the dialer, and that path is
+// not what this test is about. The full list is logged so a failure shows both.
+func requireDialedOnlyTheConfiguredServer(t *testing.T, dialer *trackingDialer) {
+	t.Helper()
+	targets := dialer.dialedTargets()
+	require.NotEmpty(t, targets, "custom dialer should have been called")
+	dialed := make([]string, 0, len(targets))
+	for _, target := range targets {
+		dialed = append(dialed, target.String())
+	}
+	t.Logf("host dialer targets: %v", dialed)
+
+	serverDials := 0
+	for _, target := range targets {
+		if target.Port != uint16(naiveServerPort) {
+			continue
+		}
+		serverDials++
+		require.Equal(t, "127.0.0.1", target.AddrString(),
+			"every dial to the proxy port must go to the configured server, not a resolved one (targets: %v)", dialed)
+	}
+	require.Greater(t, serverDials, 0, "the engine must dial the configured proxy server (targets: %v)", dialed)
+}
+
+// TestNaiveCustomDialerUDPLoopback runs the same flow with the DNS bridge on a
+// connected UDP loopback pair instead of the anonymous socketpair.
+//
+// It is the control for the Linux fix: the loopback shape answered on both the old
+// and the new reply path, so isolating a failure to one of the two tests separates a
+// socketpair reply problem from a problem in the shared reply code.
+func TestNaiveCustomDialerUDPLoopback(t *testing.T) {
+	env := setupTestEnv(t)
+	startEchoServer(t, 17000)
+
+	dialer := &trackingDialer{underlying: N.SystemDialer}
+	client := env.newNaiveClient(t, cronet.NaiveClientOptions{
+		Dialer:               dialer,
+		DNSResolver:          localhostDNSResolver(t),
+		TestForceUDPLoopback: true,
+	})
+
+	conn, err := client.DialEarly(context.Background(), M.ParseSocksaddrHostPort("127.0.0.1", 17000))
+	require.NoError(t, err)
+	defer conn.Close()
+
+	testData := []byte("Custom dialer test, UDP loopback DNS bridge")
+	_, err = conn.Write(testData)
+	require.NoError(t, err)
+
+	buf := make([]byte, len(testData))
+	_, err = io.ReadFull(conn, buf)
+	require.NoError(t, err)
+	require.Equal(t, testData, buf)
+
+	requireDialedOnlyTheConfiguredServer(t, dialer)
 }
 
 // TestNaivePipeProxy tests the socket pair proxy fallback path.

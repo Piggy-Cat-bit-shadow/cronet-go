@@ -17,6 +17,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
@@ -86,6 +87,30 @@ const (
 // server address and let that dialer resolve the name with the host's DNS policy.
 var fakeServerAddress = netip.AddrFrom4([4]byte{192, 0, 2, 1})
 
+// dnsReplyFailures counts replies the packet bridge could not put on the wire.
+//
+// The loop deliberately does not log per query (see the write-error comment below),
+// so this counter is how a failure stays observable rather than silent: tests assert
+// it, and a future periodic summary can read it.
+var dnsReplyFailures atomic.Uint64
+
+// writePacketConnWithoutAddress replies on a datagram connection that reports no peer
+// address: the anonymous AF_UNIX SOCK_DGRAM socketpair the Linux client uses, whose
+// two ends are already connected and whose peer has no name to WriteTo.
+//
+// The connection still has to be a net.Conn for the write to have a destination at
+// all. The check is on the address, not on "implements net.Conn", because an
+// unconnected *net.UDPConn implements net.Conn too and would fail here with
+// "destination address required".
+func writePacketConnWithoutAddress(conn net.PacketConn, payload []byte) error {
+	writer, isConn := conn.(net.Conn)
+	if !isConn {
+		return E.New("dns bridge: packet connection reported no peer address and is not writable without one")
+	}
+	_, err := writer.Write(payload)
+	return err
+}
+
 func serveDNSPacketConn(ctx context.Context, conn net.PacketConn, resolver DNSResolverFunc) error {
 	defer conn.Close()
 
@@ -152,28 +177,41 @@ func serveDNSPacketConn(ctx context.Context, conn net.PacketConn, resolver DNSRe
 
 		// Reply to the address the query came from.
 		//
-		// The previous code preferred the net.Conn path whenever the PacketConn also
-		// implemented net.Conn. *net.UDPConn does BOTH, so a listening (unconnected)
-		// UDP socket took the net.Conn branch and had Write called with no
-		// destination, which fails with "destination address required" - and the
-		// error was discarded, so the bridge silently never answered and Chromium
-		// waited out its timeout.
+		// Three shapes reach this loop, and the address ReadFrom reports is what
+		// tells them apart:
 		//
-		// A connected UDP socket is the only shape where writing without an address
-		// is correct, and it is also the only shape where WriteTo is unavailable.
-		// bufio.NewBindPacketConn handles both cases: it uses WriteTo when the
-		// socket is a bare PacketConn and falls back to Write for a net.Conn.
-		writeConn := bufio.NewBindPacketConn(conn, remoteAddress)
-		if _, err = writeConn.Write(packed); err != nil {
+		//   - an unconnected UDP listener: the reply must name its destination, so
+		//     it goes through a bound PacketConn.
+		//   - a connected UDP socket (the Windows pair, and the Linux loopback
+		//     pair): ReadFrom reports the peer, and a bound WriteTo that names it is
+		//     what this code has always done on those platforms.
+		//   - an anonymous AF_UNIX SOCK_DGRAM socketpair, which is the Linux
+		//     default: the two ends are already connected and the peer has no name
+		//     at all, so ReadFrom reports a nil address. There is nothing to
+		//     WriteTo, and UnixConn rejects a nil (or foreign) address with EINVAL,
+		//     so the reply has to go out on the connected endpoint with Write.
+		//
+		// The distinction cannot be "does this conn implement net.Conn": an
+		// unconnected *net.UDPConn implements it too, and Write on that socket
+		// fails with "destination address required". It is the peer address that
+		// decides.
+		var writeErr error
+		if remoteAddress == nil {
+			writeErr = writePacketConnWithoutAddress(conn, packed)
+		} else {
+			writeConn := bufio.NewBindPacketConn(conn, remoteAddress)
+			_, writeErr = writeConn.Write(packed)
+		}
+		if writeErr != nil {
 			// Keep serving: a transient send error must not kill the bridge.
 			//
 			// The error is deliberately NOT logged. This is the per-query path and
 			// Chromium's resolver issues queries continuously, so a condition that
 			// persists - the peer gone, the socket buffer full - would produce one
 			// log line per query indefinitely. The loop takes no logger argument for
-			// this reason. If observability is ever wanted here it must be a counter
-			// plus a periodic summary, or a log gated on a state TRANSITION rather
-			// than per query.
+			// this reason. The counter is what keeps the failure visible without that
+			// spam: it is what a test asserts on, and what a future summary can read.
+			dnsReplyFailures.Add(1)
 			continue
 		}
 	}
