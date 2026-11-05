@@ -1,5 +1,28 @@
 # cronet-go
 
+> **这是 JiejieBox 使用的自定义 Cronet fork，也是唯一的源码维护和依赖入口。**
+> 原有自定义改动保留；v154-patch5 是在原有源码上追加的维护补丁。
+
+## 仓库与分支
+
+| 位置 | 用途 |
+| --- | --- |
+| 本仓库 `main` | 开发源码、Go 绑定、自定义拨号与构建脚本 |
+| 本仓库 `go` | 已发布的 Go 模块和原生库；供消费方锁定版本，不用于日常开发 |
+| [naiveproxy](https://github.com/Piggy-Cat-bit-shadow/naiveproxy) 子模块 | 定制的 Chromium/Cronet 源码；具体提交以本仓库的 gitlink 为准 |
+| [cronet-go-build](https://github.com/Piggy-Cat-bit-shadow/cronet-go-build) | 临时 CI 辅助镜像，仅用于原仓库 Actions 受限期间的构建与验证 |
+
+**消费方应引用本仓库，不要引用 `cronet-go-build`。** 模块声明仍沿用
+`github.com/sagernet/cronet-go`，消费方用精确的 `replace` 指向本 fork；
+`lib` 子模块需要逐个列出，Go 不支持 `lib/*` 通配符替换。
+
+当前维护 Chromium `154.0.8037.49`，已适配 NaiveProxy `v154.0.8037.49-5`
+的证书封锁与 QUIC 补丁。原生库此次更新覆盖 Linux/amd64、Windows/amd64、
+Android/arm64、macOS/arm64、iOS/arm64；其他架构的模块存在不代表本次已重建。
+
+历史 native 分支保存在 naiveproxy 仓库的 `archive/2026-11-05/*` 标签中，
+活动分支为 `cronet-go-dev-v154-patch5`。临时 CI 仓库不改变本仓库的自定义 fork 身份。
+
 [![Reference](https://pkg.go.dev/badge/github.com/sagernet/cronet-go.svg)](https://pkg.go.dev/github.com/sagernet/cronet-go)
 
 Go bindings for [naiveproxy](https://github.com/klzgrad/naiveproxy).
@@ -108,3 +131,4 @@ git -C cronet-go-lib sparse-checkout set --no-cone /lib/windows_amd64/libcronet.
 git -C cronet-go-lib fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
 git -C cronet-go-lib checkout FETCH_HEAD
 ```
+
