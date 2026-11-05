@@ -980,19 +980,24 @@ jobs:
           LD_LIBRARY_PATH="$PWD" ./consume-purego | tee "$GITHUB_WORKSPACE/purego-version.txt"
           grep -q "engine version: " "$GITHUB_WORKSPACE/purego-version.txt"
 
-      - name: Link the published static library into a cgo program
+      - name: Assert the module carries both Linux amd64 libraries
+        # The cgo link itself is exercised by the linux build job, with the Chromium toolchain the
+        # build documents (`build-naive env`). Linking the static archive with a distribution compiler
+        # is not a supported configuration, so this step checks what a consumer receives instead of
+        # pretending that link is a meaningful test: an x86-64 ELF shared library for purego and a
+        # non-empty static archive the cgo file links by name.
         env:
           MODULE: ${{ steps.identity.outputs.module }}
         run: |
           set -euo pipefail
           export GOMODCACHE="$RUNNER_TEMP/consume-cache"
-          export GOFLAGS=-mod=mod GIT_TERMINAL_PROMPT=0
-          cd "$RUNNER_TEMP/consume"
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang lld
-          CGO_ENABLED=1 CC=clang CGO_LDFLAGS="-fuse-ld=lld" go build -o consume-cgo .
-          ./consume-cgo | tee "$GITHUB_WORKSPACE/cgo-version.txt"
-          grep -q "engine version: " "$GITHUB_WORKSPACE/cgo-version.txt"
+          library_directory=$(go list -m -f '{{.Dir}}' "${MODULE}/lib/linux_amd64")
+          test -s "${library_directory}/libcronet.a"
+          file "${library_directory}/libcronet.so" | tee "$GITHUB_WORKSPACE/libraries.txt"
+          file "${library_directory}/libcronet.a" | tee -a "$GITHUB_WORKSPACE/libraries.txt"
+          grep -q "ELF 64-bit LSB shared object, x86-64" "$GITHUB_WORKSPACE/libraries.txt"
+          grep -q "current ar archive" "$GITHUB_WORKSPACE/libraries.txt"
+          du -h "${library_directory}/libcronet.a" "${library_directory}/libcronet.so" | tee -a "$GITHUB_WORKSPACE/libraries.txt"
 
       - name: Upload the consumption log
         if: always()
@@ -1002,7 +1007,7 @@ jobs:
           path: |
             consumed-modules.txt
             purego-version.txt
-            cgo-version.txt
+            libraries.txt
           if-no-files-found: warn
 
   release:
