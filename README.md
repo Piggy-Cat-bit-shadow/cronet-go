@@ -10,7 +10,9 @@
 | 本仓库 `main` | 开发源码、Go 绑定、自定义拨号与构建脚本 |
 | 本仓库 `go` | 已发布的 Go 模块和原生库；供消费方锁定版本，不用于日常开发 |
 | [naiveproxy](https://github.com/Piggy-Cat-bit-shadow/naiveproxy) 子模块 | 定制的 Chromium/Cronet 源码；具体提交以本仓库的 gitlink 为准 |
-| [cronet-go-build](https://github.com/Piggy-Cat-bit-shadow/cronet-go-build) | 临时 CI 辅助镜像，仅用于原仓库 Actions 受限期间的构建与验证 |
+| [cronet-go-build](https://github.com/Piggy-Cat-bit-shadow/cronet-go-build) | 历史 CI 辅助镜像；原仓 Actions 已恢复，待现有任务结束后归档 |
+
+**GitHub Actions 已于 2026-11-05 手动启用并确认能启动任务；日常构建统一在[本仓 Actions](https://github.com/Piggy-Cat-bit-shadow/cronet-go/actions)运行。**
 
 **消费方应引用本仓库，不要引用 `cronet-go-build`。** 模块声明仍沿用
 `github.com/sagernet/cronet-go`，消费方用精确的 `replace` 指向本 fork；
