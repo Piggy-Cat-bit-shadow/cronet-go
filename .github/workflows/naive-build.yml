@@ -120,6 +120,23 @@ jobs:
       - name: Reset ccache stats
         if: steps.build-cache.outputs.cache-hit != 'true'
         run: ccache -z
+      - name: Warm the toolchain
+        # get-clang.sh fetches the clang build and the Debian sysroot from snapshot.debian.org, which
+        # answers 503 for a whole repository now and then. That is enough to fail a build before it
+        # compiles anything, so the download gets a few attempts of its own; the build that follows
+        # reuses what this left behind.
+        if: steps.build-cache.outputs.cache-hit != 'true'
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3 4 5; do
+            if go run ./cmd/build-naive --target=linux/${{ matrix.arch }} download-toolchain; then
+              exit 0
+            fi
+            echo "toolchain download attempt ${attempt} failed; the snapshot mirror answered with an error"
+            sleep 30
+          done
+          echo "the toolchain could not be downloaded after 5 attempts" >&2
+          exit 1
       - name: Build
         if: steps.build-cache.outputs.cache-hit != 'true'
         run: go run ./cmd/build-naive --target=linux/${{ matrix.arch }} build
@@ -369,6 +386,21 @@ jobs:
       - name: Reset ccache stats
         if: steps.build-cache.outputs.cache-hit != 'true'
         run: ccache -z
+      - name: Warm the toolchain
+        # The same snapshot.debian.org download as the Linux family: retried here so a mirror 503 does
+        # not fail the Android build before it compiles anything.
+        if: steps.build-cache.outputs.cache-hit != 'true'
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3 4 5; do
+            if go run ./cmd/build-naive --target=android/${{ matrix.arch }} download-toolchain; then
+              exit 0
+            fi
+            echo "toolchain download attempt ${attempt} failed; the snapshot mirror answered with an error"
+            sleep 30
+          done
+          echo "the toolchain could not be downloaded after 5 attempts" >&2
+          exit 1
       - name: Build
         if: steps.build-cache.outputs.cache-hit != 'true'
         run: go run ./cmd/build-naive --target=android/${{ matrix.arch }} build
@@ -448,6 +480,20 @@ jobs:
       - name: Reset ccache stats
         if: steps.build-cache.outputs.cache-hit != 'true'
         run: ccache -z
+      - name: Warm the toolchain
+        # musl pulls the sysroot from the same snapshot.debian.org service; retried for the same reason.
+        if: steps.build-cache.outputs.cache-hit != 'true'
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3 4 5; do
+            if go run ./cmd/build-naive --target=linux/${{ matrix.arch }} --libc=musl download-toolchain; then
+              exit 0
+            fi
+            echo "toolchain download attempt ${attempt} failed; the snapshot mirror answered with an error"
+            sleep 30
+          done
+          echo "the toolchain could not be downloaded after 5 attempts" >&2
+          exit 1
       - name: Build
         if: steps.build-cache.outputs.cache-hit != 'true'
         run: go run ./cmd/build-naive --target=linux/${{ matrix.arch }} --libc=musl build
