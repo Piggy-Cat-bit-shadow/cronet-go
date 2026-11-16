@@ -143,21 +143,11 @@ func generateLocalCGOFiles(targets []Target) {
 
 		buildTag := getBuildTag(t)
 
-		var ldFlags []string
-
-		libraryPath := fmt.Sprintf("${SRCDIR}/lib/%s/libcronet.a", directoryName)
 		// Go 1.27.4 rejects "-l:<filename>" in #cgo LDFLAGS (CVE-2026-97038) and
 		// validates direct archive inputs instead; every platform can use the
 		// archive path directly.
-		ldFlags = append(ldFlags, libraryPath)
-
-		ldFlags = append(ldFlags, linkFlags.LDFlags...)
-		ldFlags = append(ldFlags, linkFlags.Libs...)
-		ldFlags = append(ldFlags, linkFlags.Frameworks...)
-
-		if t.GOOS == "linux" && t.Libc == "musl" {
-			ldFlags = append(ldFlags, "-static")
-		}
+		libraryPath := fmt.Sprintf("${SRCDIR}/lib/%s/libcronet.a", directoryName)
+		ldFlags := cronetCgoLDFlags(libraryPath, linkFlags, t.GOOS == "linux" && t.Libc == "musl")
 
 		cgoContent := fmt.Sprintf(`//go:build %s && !with_purego
 
@@ -357,20 +347,10 @@ go 1.20
 
 		buildTag := getBuildTag(t)
 
-		var ldFlags []string
-
 		// Go 1.27.4 rejects "-l:<filename>" in #cgo LDFLAGS (CVE-2026-97038) and
 		// validates direct archive inputs instead; every platform can use the
 		// archive path directly.
-		ldFlags = append(ldFlags, "${SRCDIR}/libcronet.a")
-
-		ldFlags = append(ldFlags, linkFlags.LDFlags...)
-		ldFlags = append(ldFlags, linkFlags.Libs...)
-		ldFlags = append(ldFlags, linkFlags.Frameworks...)
-
-		if t.GOOS == "linux" && t.Libc == "musl" {
-			ldFlags = append(ldFlags, "-static")
-		}
+		ldFlags := cronetCgoLDFlags("${SRCDIR}/libcronet.a", linkFlags, t.GOOS == "linux" && t.Libc == "musl")
 
 		cgoContent := fmt.Sprintf(`//go:build %s && !with_purego
 
@@ -396,6 +376,22 @@ const Version = "%s"
 
 		log.Printf("Generated submodule lib/%s", directoryName)
 	}
+}
+
+// cronetCgoLDFlags builds the #cgo LDFLAGS list for a lib module.
+//
+// The archive is passed by path, not as "-l:<filename>": Go 1.27.4 rejects the
+// latter in #cgo LDFLAGS (CVE-2026-97038), and the direct path is accepted as a
+// validated archive input.
+func cronetCgoLDFlags(libraryPath string, linkFlags LinkFlags, static bool) []string {
+	ldFlags := []string{libraryPath}
+	ldFlags = append(ldFlags, linkFlags.LDFlags...)
+	ldFlags = append(ldFlags, linkFlags.Libs...)
+	ldFlags = append(ldFlags, linkFlags.Frameworks...)
+	if static {
+		ldFlags = append(ldFlags, "-static")
+	}
+	return ldFlags
 }
 
 func generatePuregoStubFile(targetDirectory, packageName, chromiumVersion string) {
