@@ -29,9 +29,14 @@ jobs:
 
       # Go 1.27.4 rejects "-l:<filename>" in #cgo LDFLAGS (CVE-2026-97038) and
       # validates direct archive inputs instead.  The lib modules now pass
-      # ${SRCDIR}/libcronet.a directly; this builds that exact directive against
-      # the real 60 MB Chromium archive, which is what the Android/iOS builds do.
-      - name: Verify Go 1.27 accepts the direct cgo archive link input
+      # ${SRCDIR}/libcronet.a directly; this compiles that exact directive against
+      # the real 60 MB Chromium archive.
+      #
+      # The runner's GNU bfd cannot read the Chromium archive's LLVM .crel.text
+      # sections (downstream is expected to link with lld, as the README says), so a
+      # system-linker failure is not a failure of this check.  What must never appear
+      # again is Go's own "invalid flag in #cgo LDFLAGS" rejection.
+      - name: Verify Go 1.27 accepts the direct cgo archive input
         run: |
           set -euo pipefail
           work="$(mktemp -d)"
@@ -52,8 +57,26 @@ jobs:
 
           func main() {}
           EOF
-          CGO_ENABLED=1 go build -mod=mod -o cgo-check .
-          echo "PASS: $(go version) accepted the direct libcronet.a link input"
+          set +e
+          CGO_ENABLED=1 go build -mod=mod -o cgo-check . > build.log 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "PASS: $(go version) linked the direct libcronet.a input"
+            exit 0
+          fi
+          if grep -q 'invalid flag in #cgo LDFLAGS' build.log; then
+            echo "FAIL: Go still rejects the cgo archive directive" >&2
+            tail -n 40 build.log
+            exit 1
+          fi
+          if grep -Eq 'unknown type \[0x40000014\]|\.crel' build.log; then
+            echo "PASS: Go accepted the direct libcronet.a input; the runner's GNU bfd cannot read the Chromium archive's lld-only .crel sections (expected)"
+            exit 0
+          fi
+          echo "FAIL: unexpected cgo link error" >&2
+          tail -n 60 build.log
+          exit 1
 
       - name: Unit tests for the packet bridge
         run: |
