@@ -27,6 +27,34 @@ jobs:
         with:
           go-version: ^1.27
 
+      # Go 1.27.4 rejects "-l:<filename>" in #cgo LDFLAGS (CVE-2026-97038) and
+      # validates direct archive inputs instead.  The lib modules now pass
+      # ${SRCDIR}/libcronet.a directly; this builds that exact directive against
+      # the real 60 MB Chromium archive, which is what the Android/iOS builds do.
+      - name: Verify Go 1.27 accepts the direct cgo archive link input
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          cd "${work}"
+          cat > go.mod <<EOF
+          module cronet-cgo-check
+
+          go 1.24
+
+          require github.com/sagernet/cronet-go/lib/linux_amd64 v0.0.0
+
+          replace github.com/sagernet/cronet-go/lib/linux_amd64 => ${{ github.workspace }}/lib/linux_amd64
+          EOF
+          cat > main.go <<'EOF'
+          package main
+
+          import _ "github.com/sagernet/cronet-go/lib/linux_amd64"
+
+          func main() {}
+          EOF
+          CGO_ENABLED=1 go build -mod=mod -o cgo-check .
+          echo "PASS: $(go version) accepted the direct libcronet.a link input"
+
       - name: Unit tests for the packet bridge
         run: |
           set -euo pipefail
