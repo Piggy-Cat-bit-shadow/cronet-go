@@ -2,8 +2,9 @@ name: Apple cgo link check
 
 # Go 1.27.4 rejects "-l:<filename>" in #cgo LDFLAGS (CVE-2026-97038); the lib
 # modules now pass ${SRCDIR}/libcronet.a directly.  This dispatch-only check
-# links the published ios/arm64 and darwin/arm64 archives with Go 1.27.4 and
-# the real Xcode toolchain, which the Windows host cannot do.
+# links every published Apple slice with Go 1.27.4 and the real Xcode
+# toolchain: iOS device, iOS simulator (arm64/amd64), tvOS device,
+# tvOS simulator (arm64/amd64) and macOS.
 on:
   workflow_dispatch:
 
@@ -16,7 +17,7 @@ env:
 jobs:
   link:
     runs-on: macos-15
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Check out the candidate
         uses: actions/checkout@v4
@@ -25,43 +26,44 @@ jobs:
         with:
           go-version: '1.27.4'
 
-      - name: Link the iOS and macOS archives
+      - name: Link all Apple slices
         run: |
           set -euo pipefail
-          work="$(mktemp -d)"
-          cd "${work}"
-          cat > go.mod <<EOF
-          module cronet-apple-check
+          base="$(mktemp -d)"
+
+          build() {
+            name="$1"; goos="$2"; goarch="$3"; tags="$4"; module="$5"
+            dir="${base}/${name}"
+            mkdir -p "${dir}"
+            cd "${dir}"
+            cat > go.mod <<EOF
+          module cronet-${name}
 
           go 1.24
 
-          require (
-            github.com/sagernet/cronet-go/lib/darwin_arm64 v0.0.0
-            github.com/sagernet/cronet-go/lib/ios_arm64 v0.0.0
-          )
+          require github.com/sagernet/cronet-go/lib/${module} v0.0.0
 
-          replace github.com/sagernet/cronet-go/lib/darwin_arm64 => github.com/Piggy-Cat-bit-shadow/cronet-go/lib/darwin_arm64 ${CRONET_LIB_VERSION}
-
-          replace github.com/sagernet/cronet-go/lib/ios_arm64 => github.com/Piggy-Cat-bit-shadow/cronet-go/lib/ios_arm64 ${CRONET_LIB_VERSION}
+          replace github.com/sagernet/cronet-go/lib/${module} => github.com/Piggy-Cat-bit-shadow/cronet-go/lib/${module} ${CRONET_LIB_VERSION}
           EOF
-          mkdir -p ioscheck maccheck
-          cat > ioscheck/main.go <<'EOF'
+            cat > main.go <<EOF
           package main
 
-          import _ "github.com/sagernet/cronet-go/lib/ios_arm64"
+          import _ "github.com/sagernet/cronet-go/lib/${module}"
 
           func main() {}
           EOF
-          cat > maccheck/main.go <<'EOF'
-          package main
+            echo "== ${name} (GOOS=${goos} GOARCH=${goarch} tags=${tags}) =="
+            GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=1 \
+              go build -mod=mod -tags "${tags}" -buildmode=c-archive -o "${base}/${name}.a" .
+            ls -l "${base}/${name}.a"
+          }
 
-          import _ "github.com/sagernet/cronet-go/lib/darwin_arm64"
+          build ios-arm64                 ios     arm64 ""                    ios_arm64
+          build ios-arm64-simulator       ios     arm64 "iossimulator"       ios_arm64_simulator
+          build ios-amd64-simulator       ios     amd64 "iossimulator"       ios_amd64_simulator
+          build tvos-arm64                ios     arm64 "tvos"               tvos_arm64
+          build tvos-arm64-simulator      ios     arm64 "tvos,tvossimulator" tvos_arm64_simulator
+          build tvos-amd64-simulator      ios     amd64 "tvos,tvossimulator" tvos_amd64_simulator
+          build darwin-arm64              darwin  arm64 ""                    darwin_arm64
 
-          func main() {}
-          EOF
-          echo "== iOS arm64 =="
-          ( cd ioscheck && GOOS=ios GOARCH=arm64 CGO_ENABLED=1 go build -mod=mod -buildmode=c-archive -o "${work}/ioscheck.a" . )
-          echo "== macOS arm64 =="
-          ( cd maccheck && GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 go build -mod=mod -buildmode=c-archive -o "${work}/maccheck.a" . )
-          ls -l "${work}/ioscheck.a" "${work}/maccheck.a"
-          echo "PASS: $(go version) linked both Apple archives"
+          echo "PASS: $(go version) linked all Apple slices"
