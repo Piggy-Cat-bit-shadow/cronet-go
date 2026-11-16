@@ -149,7 +149,7 @@ func generateLocalCGOFiles(targets []Target) {
 		if t.GOOS == "darwin" || t.GOOS == "ios" {
 			ldFlags = append(ldFlags, libraryPath)
 		} else {
-			ldFlags = append(ldFlags, fmt.Sprintf("-L${SRCDIR}/lib/%s", directoryName), "-l:libcronet.a")
+			ldFlags = append(ldFlags, fmt.Sprintf("${SRCDIR}/lib/%s/libcronet.a", directoryName))
 		}
 
 		ldFlags = append(ldFlags, linkFlags.LDFlags...)
@@ -363,7 +363,7 @@ go 1.20
 		if t.GOOS == "darwin" || t.GOOS == "ios" {
 			ldFlags = append(ldFlags, "${SRCDIR}/libcronet.a")
 		} else {
-			ldFlags = append(ldFlags, "-L${SRCDIR}", "-l:libcronet.a")
+			ldFlags = append(ldFlags, "${SRCDIR}/libcronet.a")
 		}
 
 		ldFlags = append(ldFlags, linkFlags.LDFlags...)
