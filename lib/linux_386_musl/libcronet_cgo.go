@@ -2,7 +2,7 @@
 
 package linux_386_musl
 
-// #cgo LDFLAGS: -L${SRCDIR} -l:libcronet.a -ldl -lpthread -lrt -lresolv -static
+// #cgo LDFLAGS: ${SRCDIR}/libcronet.a -ldl -lpthread -lrt -lresolv -static
 import "C"
 
 const Version = "154.0.8037.49"

@@ -146,11 +146,10 @@ func generateLocalCGOFiles(targets []Target) {
 		var ldFlags []string
 
 		libraryPath := fmt.Sprintf("${SRCDIR}/lib/%s/libcronet.a", directoryName)
-		if t.GOOS == "darwin" || t.GOOS == "ios" {
-			ldFlags = append(ldFlags, libraryPath)
-		} else {
-			ldFlags = append(ldFlags, fmt.Sprintf("-L${SRCDIR}/lib/%s", directoryName), "-l:libcronet.a")
-		}
+		// Go 1.27.4 rejects "-l:<filename>" in #cgo LDFLAGS (CVE-2026-97038) and
+		// validates direct archive inputs instead; every platform can use the
+		// archive path directly.
+		ldFlags = append(ldFlags, libraryPath)
 
 		ldFlags = append(ldFlags, linkFlags.LDFlags...)
 		ldFlags = append(ldFlags, linkFlags.Libs...)
@@ -360,11 +359,10 @@ go 1.20
 
 		var ldFlags []string
 
-		if t.GOOS == "darwin" || t.GOOS == "ios" {
-			ldFlags = append(ldFlags, "${SRCDIR}/libcronet.a")
-		} else {
-			ldFlags = append(ldFlags, "-L${SRCDIR}", "-l:libcronet.a")
-		}
+		// Go 1.27.4 rejects "-l:<filename>" in #cgo LDFLAGS (CVE-2026-97038) and
+		// validates direct archive inputs instead; every platform can use the
+		// archive path directly.
+		ldFlags = append(ldFlags, "${SRCDIR}/libcronet.a")
 
 		ldFlags = append(ldFlags, linkFlags.LDFlags...)
 		ldFlags = append(ldFlags, linkFlags.Libs...)

@@ -2,7 +2,7 @@
 
 package linux_mips64le
 
-// #cgo LDFLAGS: -L${SRCDIR} -l:libcronet.a -ldl -lpthread -lrt -lm -lresolv
+// #cgo LDFLAGS: ${SRCDIR}/libcronet.a -ldl -lpthread -lrt -lm -lresolv
 import "C"
 
 const Version = "154.0.8037.49"
